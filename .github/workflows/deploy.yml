@@ -33,13 +33,17 @@ jobs:
       run: mvn -B -ntp dependency-check:check
       working-directory: app
     - name: Filesystem and config scan (Trivy)
-      uses: aquasecurity/trivy-action@0.28.0
-      with:
-        scan-type: fs
-        scan-ref: .
-        severity: HIGH,CRITICAL
-        exit-code: '1'
-        ignore-unfixed: 'true'
+      run: "set -euo pipefail\n# Trivy runs from its OFFICIAL CONTAINER IMAGE rather\
+        \ than a\n# marketplace action. A `uses:` reference is resolved by GitHub\
+        \ before\n# any step executes, so a tag that does not exist kills the whole\
+        \ job\n# during action resolution with no scan attempted. An image tag is\n\
+        # verified at pull time by the registry and fails with a clear error.\n# The\
+        \ gate itself is unchanged: HIGH/CRITICAL findings still fail.\nTRIVY_IMAGE=\"\
+        aquasec/trivy:0.58.1\"\ndocker run --rm \\\n  -v \"${GITHUB_WORKSPACE}:/workspace\"\
+        \ \\\n  -v \"${HOME}/.cache/trivy:/root/.cache/trivy\" \\\n  \"$TRIVY_IMAGE\"\
+        \ \\\n  filesystem \\\n  --scanners vuln,secret,misconfig \\\n  --severity\
+        \ HIGH,CRITICAL \\\n  --ignore-unfixed \\\n  --exit-code 1 \\\n  --no-progress\
+        \ \\\n  /workspace\n"
   image:
     runs-on: ubuntu-latest
     needs:
