@@ -30,19 +30,29 @@ metadata:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 
-    # THE SECURITY CONTROL.
+    # THE NETWORK CONTROL.
     #
     # This annotation writes the allowlist into the ALB's security group, so
-    # traffic from anywhere else is refused at the load balancer and never
-    # reaches argocd-server. TLS protects the credential in transit; THIS is
-    # what stops the internet from reaching the login form at all.
+    # traffic from any source outside it is refused at the load balancer and
+    # never reaches argocd-server. TLS protects the credential in transit;
+    # THIS is what governs who can reach the login form at all.
     #
     # The Argo CD UI can change what runs in this cluster, read every Secret
     # Argo manages, and repoint Applications at arbitrary Git repositories. It
-    # authenticates with a single password. Do not widen this to 0.0.0.0/0 —
-    # terraform's argocd_allowed_cidrs variable has a validation rule that
-    # rejects it, and that rule is intentional. If access is needed from
-    # unpredictable networks, add SSO/OIDC and set admin.enabled=false.
+    # authenticates with a single password.
+    #
+    # CURRENT VALUE: 0.0.0.0/0 — open to the internet, by explicit operator
+    # decision on 2026-09-05 (see the ACCEPTED RISK note on
+    # infra/variables.tf:argocd_allowed_cidrs). The validation rules that
+    # previously refused this value, here and in terraform, were removed on
+    # that instruction. With the list open, the ARGOCD_ADMIN_PASSWORD secret is
+    # the ONLY barrier in front of cluster-admin authority on this cluster.
+    #
+    # The durable fix is SSO/OIDC with admin.enabled=false, which replaces the
+    # single shared credential with per-person identities and makes this
+    # annotation far less load-bearing. Until then, keep the admin password
+    # long, unique and rotated, and narrow this list again as soon as the
+    # operational need for open access ends.
     alb.ingress.kubernetes.io/inbound-cidrs: "${ARGOCD_CIDR_LIST}"
 
     # TLS terminates here at the ALB. argocd-server runs with

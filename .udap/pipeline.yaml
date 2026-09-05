@@ -80,12 +80,14 @@ stages:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
-      # The operator's source CIDR for the Argo CD UI, in HCL list syntax.
+      # The source CIDR allowlist for the Argo CD UI, in HCL list syntax.
       # Held as a SECRET rather than committed: this repository is public, and
-      # a home IP address handed to a scanner is a gift. terraform's variable
-      # has no default and a validation rule rejecting 0.0.0.0/0, so a missing
-      # or careless value fails the apply rather than quietly opening the
-      # admin console.
+      # an operator's home IP handed to a scanner is a gift. terraform's
+      # variable has no default and rejects an EMPTY list, so a missing value
+      # fails the apply rather than quietly rendering an unrestricted rule.
+      #
+      # As of 2026-09-05 this is ["0.0.0.0/0"] by explicit operator decision -
+      # see the ACCEPTED RISK note on the variable in infra/variables.tf.
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
     steps:
       - name: Set up Terraform
@@ -298,6 +300,10 @@ stages:
           # Argo compares that timestamp against issued JWTs and invalidates
           # sessions older than the change, so omitting it would leave tokens
           # minted under the OLD password valid indefinitely.
+          #
+          # With the UI now reachable from any source address, this password is
+          # the ONLY barrier in front of cluster-admin authority. Keep the
+          # ARGOCD_ADMIN_PASSWORD secret long and unique, and rotate it here.
           if ! command -v htpasswd >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq apache2-utils
@@ -354,29 +360,37 @@ stages:
           # comma-separated string. Strip brackets, quotes and spaces.
           ARGOCD_CIDR_LIST="$(printf '%s' "$ARGOCD_ALLOWED_CIDRS" \
             | tr -d '[]" ' )"
-          # Refuse to render an ingress with an empty allowlist. The ALB
-          # controller treats a missing inbound-cidrs annotation as "no
-          # restriction" - an open admin console, the exact outcome this
-          # design exists to prevent. Fail loudly instead.
+          # Refuse to render an ingress with an EMPTY allowlist. This check is
+          # NOT about how wide the list is - it is about the list being absent.
+          # The ALB controller treats a missing inbound-cidrs annotation as "no
+          # restriction", so an unset or malformed secret would silently produce
+          # an open console that nobody decided on. An explicitly configured
+          # 0.0.0.0/0 is a decision and is allowed through (see below); an empty
+          # value is a mistake and fails here.
           if [ -z "$ARGOCD_CIDR_LIST" ]; then
             echo "ERROR: the resolved CIDR allowlist is empty."
             echo "Refusing to create an internet-facing ingress for the Argo CD"
-            echo "admin UI without a source allowlist. Check that the"
+            echo "admin UI without an explicit source list. Check that the"
             echo "ARGOCD_ALLOWED_CIDRS secret is set to an HCL list, e.g."
             echo '  ["203.0.113.10/32"]'
             exit 1
           fi
-          # Belt and braces: the terraform variable already rejects 0.0.0.0/0
-          # at plan time, but this file is applied with kubectl and would not
-          # be caught by that if the two ever drifted apart.
+          # 0.0.0.0/0 USED TO BE REFUSED HERE, mirroring a matching validation
+          # rule on the terraform variable. Both were removed on 2026-09-05 on
+          # the operator's explicit instruction, after the exposure and the two
+          # safer alternatives (a second allowlisted CIDR, or SSO/OIDC with
+          # admin.enabled=false) were presented and declined. See the ACCEPTED
+          # RISK note in infra/variables.tf. Announce the exposure in the log so
+          # it stays visible on every deploy rather than becoming invisible
+          # default behaviour.
           case ",$ARGOCD_CIDR_LIST," in
             *,0.0.0.0/0,*)
-              echo "ERROR: allowlist contains 0.0.0.0/0."
-              echo "The Argo CD UI holds cluster-admin authority behind a single"
-              echo "password. Exposing it to the internet is not a supported"
-              echo "configuration. Use SSO/OIDC with admin.enabled=false if"
-              echo "access from arbitrary networks is required."
-              exit 1
+              echo "NOTICE: the Argo CD admin UI is being exposed to 0.0.0.0/0."
+              echo "Every source address on the internet can reach the login"
+              echo "form. The ARGOCD_ADMIN_PASSWORD secret is the only barrier"
+              echo "in front of cluster-admin authority over this cluster."
+              echo "This is an accepted operator decision, not a default."
+              echo "The durable fix is SSO/OIDC with admin.enabled=false."
               ;;
           esac
           export ARGOCD_HOSTNAME="$HOSTNAME"
@@ -466,6 +480,7 @@ stages:
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
+      ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
     steps:
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -566,6 +581,10 @@ stages:
             fi
             sleep 15
           done
+          # Report the ACTUAL exposure rather than a fixed sentence. Claiming
+          # the console is allowlisted when it is open to the internet would be
+          # a false assurance printed on every deploy.
+          CIDRS="$(printf '%s' "$ARGOCD_ALLOWED_CIDRS" | tr -d '[]" ')"
           echo "==================================================================="
           echo "Argo CD UI: https://${HOSTNAME}"
           echo "ALB hostname: ${ALB}"
@@ -575,9 +594,18 @@ stages:
           echo "  Name  : ${HOSTNAME%%.*}"
           echo "  Value : ${ALB}"
           echo
-          echo "Reachable ONLY from the allowlisted source CIDR. Any other"
-          echo "source is refused by the ALB security group and will simply"
-          echo "time out - that is the control working, not an outage."
+          case ",$CIDRS," in
+            *,0.0.0.0/0,*)
+              echo "EXPOSURE: reachable from ANY source address on the internet."
+              echo "The admin password is the only barrier in front of"
+              echo "cluster-admin authority. Accepted operator decision."
+              ;;
+            *)
+              echo "Reachable ONLY from the allowlisted source CIDRs. Any other"
+              echo "source is refused by the ALB security group and will simply"
+              echo "time out - that is the control working, not an outage."
+              ;;
+          esac
           echo "==================================================================="
 
 rollback:

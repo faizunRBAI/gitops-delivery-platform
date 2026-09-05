@@ -225,13 +225,16 @@ jobs:
         \ cost. Writing admin.passwordMtime alongside it is REQUIRED:\n# Argo compares\
         \ that timestamp against issued JWTs and invalidates\n# sessions older than\
         \ the change, so omitting it would leave tokens\n# minted under the OLD password\
-        \ valid indefinitely.\nif ! command -v htpasswd >/dev/null 2>&1; then\n  sudo\
-        \ apt-get update -qq\n  sudo apt-get install -y -qq apache2-utils\nfi\nHASH=\"\
-        $(htpasswd -nbBC 10 \"\" \"$ARGOCD_ADMIN_PASSWORD\" | tr -d ':\\n' | sed 's/^\\\
-        $2y/\\$2a/')\"\nMTIME=\"$(date -u +%FT%TZ)\"\nkubectl -n argocd patch secret\
-        \ argocd-secret \\\n  -p \"{\\\"stringData\\\":{\\\"admin.password\\\":\\\"\
-        ${HASH}\\\",\\\"admin.passwordMtime\\\":\\\"${MTIME}\\\"}}\"\n# Idempotent:\
-        \ absent on every run after the first.\nkubectl -n argocd delete secret argocd-initial-admin-secret\
+        \ valid indefinitely.\n#\n# With the UI now reachable from any source address,\
+        \ this password is\n# the ONLY barrier in front of cluster-admin authority.\
+        \ Keep the\n# ARGOCD_ADMIN_PASSWORD secret long and unique, and rotate it\
+        \ here.\nif ! command -v htpasswd >/dev/null 2>&1; then\n  sudo apt-get update\
+        \ -qq\n  sudo apt-get install -y -qq apache2-utils\nfi\nHASH=\"$(htpasswd\
+        \ -nbBC 10 \"\" \"$ARGOCD_ADMIN_PASSWORD\" | tr -d ':\\n' | sed 's/^\\$2y/\\\
+        $2a/')\"\nMTIME=\"$(date -u +%FT%TZ)\"\nkubectl -n argocd patch secret argocd-secret\
+        \ \\\n  -p \"{\\\"stringData\\\":{\\\"admin.password\\\":\\\"${HASH}\\\",\\\
+        \"admin.passwordMtime\\\":\\\"${MTIME}\\\"}}\"\n# Idempotent: absent on every\
+        \ run after the first.\nkubectl -n argocd delete secret argocd-initial-admin-secret\
         \ --ignore-not-found\n# argocd-server caches the credential; restart so the\
         \ new hash is live\n# before the verify stage or the operator tries to log\
         \ in.\nkubectl -n argocd rollout restart deployment argocd-server\nkubectl\
@@ -264,23 +267,32 @@ jobs:
         \ as TF_VAR_argocd_allowed_cidrs. The ALB annotation needs a bare\n# comma-separated\
         \ string. Strip brackets, quotes and spaces.\nARGOCD_CIDR_LIST=\"$(printf\
         \ '%s' \"$ARGOCD_ALLOWED_CIDRS\" \\\n  | tr -d '[]\" ' )\"\n# Refuse to render\
-        \ an ingress with an empty allowlist. The ALB\n# controller treats a missing\
-        \ inbound-cidrs annotation as \"no\n# restriction\" - an open admin console,\
-        \ the exact outcome this\n# design exists to prevent. Fail loudly instead.\n\
-        if [ -z \"$ARGOCD_CIDR_LIST\" ]; then\n  echo \"ERROR: the resolved CIDR allowlist\
+        \ an ingress with an EMPTY allowlist. This check is\n# NOT about how wide\
+        \ the list is - it is about the list being absent.\n# The ALB controller treats\
+        \ a missing inbound-cidrs annotation as \"no\n# restriction\", so an unset\
+        \ or malformed secret would silently produce\n# an open console that nobody\
+        \ decided on. An explicitly configured\n# 0.0.0.0/0 is a decision and is allowed\
+        \ through (see below); an empty\n# value is a mistake and fails here.\nif\
+        \ [ -z \"$ARGOCD_CIDR_LIST\" ]; then\n  echo \"ERROR: the resolved CIDR allowlist\
         \ is empty.\"\n  echo \"Refusing to create an internet-facing ingress for\
-        \ the Argo CD\"\n  echo \"admin UI without a source allowlist. Check that\
-        \ the\"\n  echo \"ARGOCD_ALLOWED_CIDRS secret is set to an HCL list, e.g.\"\
-        \n  echo '  [\"203.0.113.10/32\"]'\n  exit 1\nfi\n# Belt and braces: the terraform\
-        \ variable already rejects 0.0.0.0/0\n# at plan time, but this file is applied\
-        \ with kubectl and would not\n# be caught by that if the two ever drifted\
-        \ apart.\ncase \",$ARGOCD_CIDR_LIST,\" in\n  *,0.0.0.0/0,*)\n    echo \"ERROR:\
-        \ allowlist contains 0.0.0.0/0.\"\n    echo \"The Argo CD UI holds cluster-admin\
-        \ authority behind a single\"\n    echo \"password. Exposing it to the internet\
-        \ is not a supported\"\n    echo \"configuration. Use SSO/OIDC with admin.enabled=false\
-        \ if\"\n    echo \"access from arbitrary networks is required.\"\n    exit\
-        \ 1\n    ;;\nesac\nexport ARGOCD_HOSTNAME=\"$HOSTNAME\"\nexport ARGOCD_CERT_ARN=\"\
-        $(cat /tmp/acm_arn)\"\nexport ARGOCD_CIDR_LIST\nexport PROJECT_NAME\nenvsubst\
+        \ the Argo CD\"\n  echo \"admin UI without an explicit source list. Check\
+        \ that the\"\n  echo \"ARGOCD_ALLOWED_CIDRS secret is set to an HCL list,\
+        \ e.g.\"\n  echo '  [\"203.0.113.10/32\"]'\n  exit 1\nfi\n# 0.0.0.0/0 USED\
+        \ TO BE REFUSED HERE, mirroring a matching validation\n# rule on the terraform\
+        \ variable. Both were removed on 2026-09-05 on\n# the operator's explicit\
+        \ instruction, after the exposure and the two\n# safer alternatives (a second\
+        \ allowlisted CIDR, or SSO/OIDC with\n# admin.enabled=false) were presented\
+        \ and declined. See the ACCEPTED\n# RISK note in infra/variables.tf. Announce\
+        \ the exposure in the log so\n# it stays visible on every deploy rather than\
+        \ becoming invisible\n# default behaviour.\ncase \",$ARGOCD_CIDR_LIST,\" in\n\
+        \  *,0.0.0.0/0,*)\n    echo \"NOTICE: the Argo CD admin UI is being exposed\
+        \ to 0.0.0.0/0.\"\n    echo \"Every source address on the internet can reach\
+        \ the login\"\n    echo \"form. The ARGOCD_ADMIN_PASSWORD secret is the only\
+        \ barrier\"\n    echo \"in front of cluster-admin authority over this cluster.\"\
+        \n    echo \"This is an accepted operator decision, not a default.\"\n   \
+        \ echo \"The durable fix is SSO/OIDC with admin.enabled=false.\"\n    ;;\n\
+        esac\nexport ARGOCD_HOSTNAME=\"$HOSTNAME\"\nexport ARGOCD_CERT_ARN=\"$(cat\
+        \ /tmp/acm_arn)\"\nexport ARGOCD_CIDR_LIST\nexport PROJECT_NAME\nenvsubst\
         \ < gitops/argocd-ingress.yaml | kubectl apply -f -\necho \"Argo CD ingress\
         \ applied for ${HOSTNAME}\"\n"
     - name: Confirm the GitOps repository is anonymously readable
@@ -346,6 +358,7 @@ jobs:
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
+      ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
@@ -406,12 +419,19 @@ jobs:
         \ 2>/dev/null || true)\"\n  if [ -n \"$ALB\" ]; then\n    break\n  fi\n  if\
         \ [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n    echo \"timed out waiting for\
         \ the Argo CD ALB hostname\"\n    kubectl describe ingress argocd-server -n\
-        \ argocd\n    exit 1\n  fi\n  sleep 15\ndone\necho \"===================================================================\"\
+        \ argocd\n    exit 1\n  fi\n  sleep 15\ndone\n# Report the ACTUAL exposure\
+        \ rather than a fixed sentence. Claiming\n# the console is allowlisted when\
+        \ it is open to the internet would be\n# a false assurance printed on every\
+        \ deploy.\nCIDRS=\"$(printf '%s' \"$ARGOCD_ALLOWED_CIDRS\" | tr -d '[]\" ')\"\
+        \necho \"===================================================================\"\
         \necho \"Argo CD UI: https://${HOSTNAME}\"\necho \"ALB hostname: ${ALB}\"\n\
         echo\necho \"If https://${HOSTNAME} does not resolve yet, add this in cPanel:\"\
         \necho \"  Type  : CNAME\"\necho \"  Name  : ${HOSTNAME%%.*}\"\necho \"  Value\
-        \ : ${ALB}\"\necho\necho \"Reachable ONLY from the allowlisted source CIDR.\
-        \ Any other\"\necho \"source is refused by the ALB security group and will\
-        \ simply\"\necho \"time out - that is the control working, not an outage.\"\
-        \necho \"===================================================================\"\
+        \ : ${ALB}\"\necho\ncase \",$CIDRS,\" in\n  *,0.0.0.0/0,*)\n    echo \"EXPOSURE:\
+        \ reachable from ANY source address on the internet.\"\n    echo \"The admin\
+        \ password is the only barrier in front of\"\n    echo \"cluster-admin authority.\
+        \ Accepted operator decision.\"\n    ;;\n  *)\n    echo \"Reachable ONLY from\
+        \ the allowlisted source CIDRs. Any other\"\n    echo \"source is refused\
+        \ by the ALB security group and will simply\"\n    echo \"time out - that\
+        \ is the control working, not an outage.\"\n    ;;\nesac\necho \"===================================================================\"\
         \n"
