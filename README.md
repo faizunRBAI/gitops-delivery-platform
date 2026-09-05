@@ -20,10 +20,11 @@ reconciled into the cluster by Argo CD.
 | Path | What lives there |
 |---|---|
 | `infra/` | **All** Terraform: VPC, EKS cluster + managed node group, ECR, IRSA role for the AWS Load Balancer Controller |
-| `app/` | Spring Boot 3.4 / Java 21 service + `Dockerfile` |
+| `app/` | Spring Boot 3.5 / Java 21 service + `Dockerfile` |
 | `chart/gitops-delivery-platform/` | The Helm chart Argo CD renders |
 | `gitops/root-app.yaml` | The app-of-apps root Application |
 | `gitops/apps/` | Child Applications, rendered as a chart (`app-dev`) |
+| `.trivyignore.yaml` | Scoped, justified, **expiring** security exceptions |
 | `.udap/architecture.d2` | Architecture source of truth |
 | `.udap/pipeline.yaml` | Pipeline spec — CI workflows are **rendered** from this |
 | `.udap/notes.md` | Working notes: decisions, gotchas, what's next |
@@ -85,6 +86,12 @@ resolution with no scan attempted — which is exactly how the first deploy
 attempt failed. An image tag is verified by the registry at pull time and fails
 loudly inside the step instead.
 
+The scan covers the Maven dependency tree, the container base image, secrets in
+the tree, **and `infra/*.tf` misconfiguration** — so Terraform findings block
+the deploy before `provision` creates anything, which is the cheap place to find
+them. It has already caught two actuator CVEs, missing EKS secret encryption and
+public-IP-on-launch subnets, all fixed at their cause before a dollar was spent.
+
 **OWASP Dependency-Check was removed** (2026-09-05). It downloads and unpacks
 the full NVD CVE feed on a cold runner cache, routinely costing 5–15 minutes and
 occasionally rate-limiting without an NVD API key. Trivy covers the same Maven
@@ -97,6 +104,32 @@ occasionally flags a Java library Trivy's advisory sources do not. If this stops
 being a throwaway exercise, run Dependency-Check on a schedule (an extra
 `pipelines:` workflow with a cached NVD data directory) rather than reinstating
 it on the critical path.
+
+### Accepted security exceptions
+
+`.trivyignore.yaml` holds exactly **two** entries, both scoped to `infra/eks.tf`
+and both expiring `2026-12-31`:
+
+| Check | Finding |
+|---|---|
+| `AVD-AWS-0040` | EKS public cluster access is enabled |
+| `AVD-AWS-0041` | EKS cluster allows access from `0.0.0.0/0` |
+
+These are two Trivy views of **one** structural fact: the `configure` stage
+drives `helm` and `kubectl` from a GitHub-hosted runner, which sits outside the
+VPC and draws from Azure's public IP ranges with no stable egress address. No
+CIDR narrower than `0.0.0.0/0` lets the deploy reach the API server, and turning
+the public endpoint off makes the pipeline unrunnable. Both close together in
+Phase 2 via a self-hosted runner inside the VPC.
+
+Mitigations in place today: private endpoint access enabled so in-VPC traffic
+never leaves the network; IAM authentication in API mode, so *reachability is
+not authorization* and an unauthenticated caller gets `401`; API, audit and
+authenticator logs shipped to CloudWatch; secrets encrypted at rest with a
+customer-managed KMS key.
+
+Nothing else is suppressed. Every other finding was fixed rather than ignored,
+and the severity gate itself has never been relaxed.
 
 ---
 
@@ -173,11 +206,12 @@ the rendered destroy workflow with the same backend and credentials.
 |---|---|
 | 2 | Argo Rollouts controller; blue/green via `blueGreen.enabled` |
 | 2 | Analysis gate on the preview Service before traffic switches |
+| 2 | **Self-hosted runner inside the VPC** → narrow `cluster_public_access_cidrs`, disable the public endpoint, drop both `.trivyignore.yaml` entries |
 | 3 | Canary with weighted steps + automated rollback on metric regression |
 | 3 | Observability: Prometheus, Grafana, Argo CD notifications, Rollouts label-sync |
 | 4 | Flux under `flux/` as a second reconciler for comparison |
 | — | **Scheduled OWASP Dependency-Check** with a cached NVD directory, off the critical path (removed from `security` on 2026-09-05 for runtime) |
-| — | Private-only API endpoint, PodSecurity admission, NetworkPolicies |
+| — | PodSecurity admission, NetworkPolicies |
 | — | HTTPS: ACM certificate + external-dns on a real domain |
 | — | external-secrets / sealed-secrets |
 | — | Autoscaling (Karpenter or Cluster Autoscaler), PodDisruptionBudgets |
@@ -193,6 +227,6 @@ so Phase 2 is a flag flip rather than a chart rewrite.
 ## Cost
 
 Roughly **$190–200/month** in `us-east-1`: EKS control plane $73, 2×`t3.medium`
-~$60, ALB ~$17–22, NAT gateway ~$32, plus EBS/ECR/data transfer. Dropping the
-NAT gateway (nodes in public subnets) saves ~$32 and running a single node saves
-~$30.
+~$60, ALB ~$17–22, NAT gateway ~$32, plus EBS/ECR/data transfer and ~$1 for the
+KMS key. Dropping the NAT gateway (nodes in public subnets) saves ~$32 and
+running a single node saves ~$30.

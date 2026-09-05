@@ -8,6 +8,13 @@
 #   AVD-AWS-0039  EKS secret encryption      -> KMS CMK + encryption_config added
 #   AVD-AWS-0164  public-IP-on-launch subnet -> map_public_ip_on_launch removed
 #   CVE-2026-22731/22733 actuator auth bypass -> Spring Boot 3.4.1 -> 3.5.12
+#
+# AVD-AWS-0040 and AVD-AWS-0041 are two Trivy checks over ONE structural fact:
+# the EKS API endpoint is publicly reachable from an unbounded CIDR because the
+# configure stage drives helm/kubectl from a GitHub-hosted runner outside the
+# VPC. Both are closed by the SAME Phase 2 work (self-hosted runner in-VPC ->
+# narrow cluster_public_access_cidrs -> disable public endpoint), so they expire
+# together. Approved by the user on 2026-09-05 with the exposure stated.
 
 misconfigurations:
   - id: AVD-AWS-0040
@@ -24,4 +31,22 @@ misconfigurations:
       (network reachability is not authorization); public_access_cidrs is an
       explicit variable ready to be narrowed to a runner egress range; API,
       audit and authenticator logs shipped to CloudWatch.
+    expiredAt: 2026-12-31
+
+  - id: AVD-AWS-0041
+    paths:
+      - "infra/eks.tf"
+    statement: >-
+      "Cluster allows access from a public CIDR: 0.0.0.0/0." This is the same
+      structural constraint as AVD-AWS-0040, seen from the allowlist side.
+      GitHub-hosted runners draw from Azure's public IP ranges with no stable
+      egress address, so no CIDR narrower than 0.0.0.0/0 lets the configure
+      stage reach the API server; a narrower list would break the deploy rather
+      than secure it. NOTE: the value is now an explicit variable
+      (cluster_public_access_cidrs) precisely so Phase 2 can narrow it to a
+      self-hosted runner's egress range without touching this file - which is
+      also why this check began firing at all. Mitigations are identical to
+      AVD-AWS-0040: private endpoint access on, IAM authentication in API mode,
+      and API/audit/authenticator logs to CloudWatch. Reachability is not
+      authorization; an unauthenticated caller reaching this endpoint gets 401.
     expiredAt: 2026-12-31
