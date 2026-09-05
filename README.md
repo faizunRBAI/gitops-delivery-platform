@@ -64,7 +64,7 @@ so no commit can retrigger anything. The guards would be cargo cult here.
 | Stage | Does |
 |---|---|
 | `test` | `mvn verify` — unit + MockMvc tests |
-| `security` | OWASP Dependency-Check + Trivy filesystem scan (HIGH/CRITICAL fail) |
+| `security` | Trivy scan of the tree: vuln + secret + misconfig, HIGH/CRITICAL fail the build |
 | `image` | Builds the jar, builds the image, pushes to ECR tagged with the commit SHA |
 | `provision` | `terraform init -reconfigure` + `apply` over `infra/` |
 | `configure` | Argo CD install, ALB controller, anonymous-read check, root app, image-tag patch |
@@ -75,6 +75,28 @@ so no commit can retrigger anything. The guards would be cargo cult here.
 `terraform output -raw`. Nothing is threaded between jobs: GitHub silently drops
 job outputs containing a secret substring, and `PROJECT_NAME` is a secret that
 appears inside every resource name here.
+
+### What the security stage does and does not cover
+
+Trivy runs from the official `aquasec/trivy` **container image** rather than a
+marketplace action. A `uses:` reference is resolved by GitHub *before any step
+executes*, so a tag that does not exist kills the entire job during action
+resolution with no scan attempted — which is exactly how the first deploy
+attempt failed. An image tag is verified by the registry at pull time and fails
+loudly inside the step instead.
+
+**OWASP Dependency-Check was removed** (2026-09-05). It downloads and unpacks
+the full NVD CVE feed on a cold runner cache, routinely costing 5–15 minutes and
+occasionally rate-limiting without an NVD API key. Trivy covers the same Maven
+dependency tree *and* the container base image — which Dependency-Check never
+inspected — in well under a minute. The `--severity HIGH,CRITICAL --exit-code 1`
+gate is unchanged; the stage still blocks `image`.
+
+The residual gap is Dependency-Check's NVD-specific CPE matching, which
+occasionally flags a Java library Trivy's advisory sources do not. If this stops
+being a throwaway exercise, run Dependency-Check on a schedule (an extra
+`pipelines:` workflow with a cached NVD data directory) rather than reinstating
+it on the critical path.
 
 ---
 
@@ -154,6 +176,7 @@ the rendered destroy workflow with the same backend and credentials.
 | 3 | Canary with weighted steps + automated rollback on metric regression |
 | 3 | Observability: Prometheus, Grafana, Argo CD notifications, Rollouts label-sync |
 | 4 | Flux under `flux/` as a second reconciler for comparison |
+| — | **Scheduled OWASP Dependency-Check** with a cached NVD directory, off the critical path (removed from `security` on 2026-09-05 for runtime) |
 | — | Private-only API endpoint, PodSecurity admission, NetworkPolicies |
 | — | HTTPS: ACM certificate + external-dns on a real domain |
 | — | external-secrets / sealed-secrets |

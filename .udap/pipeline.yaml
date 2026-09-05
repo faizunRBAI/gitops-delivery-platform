@@ -23,15 +23,13 @@ stages:
     needs: []
     timeout_minutes: 20
     steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-      - name: Dependency vulnerability scan (OWASP Dependency-Check)
-        run: mvn -B -ntp dependency-check:check
-        working-directory: app
+      # OWASP Dependency-Check was REMOVED on 2026-09-05 at the user's request:
+      # it downloads and unpacks the full NVD CVE feed on a cold runner cache,
+      # routinely costing 5-15 minutes. Trivy covers the same Maven dependency
+      # tree AND the container base image (which Dependency-Check never looked
+      # at) in well under a minute. The Set up JDK step went with it - it existed
+      # only to run the Maven plugin; Trivy scans the filesystem and needs no JDK.
+      # The FAIL GATE IS UNCHANGED: HIGH/CRITICAL findings still fail the build.
       - name: Filesystem and config scan (Trivy)
         run: |
           set -euo pipefail
@@ -40,7 +38,6 @@ stages:
           # any step executes, so a tag that does not exist kills the whole job
           # during action resolution with no scan attempted. An image tag is
           # verified at pull time by the registry and fails with a clear error.
-          # The gate itself is unchanged: HIGH/CRITICAL findings still fail.
           TRIVY_IMAGE="aquasec/trivy:0.58.1"
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/workspace" \

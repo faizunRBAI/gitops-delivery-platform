@@ -19,7 +19,6 @@
 
   <properties>
     <java.version>21</java.version>
-    <dependency-check-maven.version>11.1.0</dependency-check-maven.version>
   </properties>
 
   <dependencies>
@@ -44,18 +43,6 @@
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
-      </plugin>
-
-      <!-- Runs only in the security stage: mvn dependency-check:check -->
-      <plugin>
-        <groupId>org.owasp</groupId>
-        <artifactId>dependency-check-maven</artifactId>
-        <version>${dependency-check-maven.version}</version>
-        <configuration>
-          <failBuildOnCVSS>7</failBuildOnCVSS>
-          <nvdApiDelay>8000</nvdApiDelay>
-          <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
-        </configuration>
       </plugin>
     </plugins>
   </build>
