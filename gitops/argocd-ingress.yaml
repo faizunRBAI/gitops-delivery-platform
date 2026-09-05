@@ -1,0 +1,75 @@
+# Argo CD admin UI ingress.
+#
+# NOT managed by Argo CD itself, deliberately. Argo is the sole writer of
+# gitops/ and chart/, but this object is Argo's OWN front door: if a bad sync
+# ever broke it, the UI needed to diagnose the bad sync would be gone with it.
+# The configure stage applies this file directly with kubectl, and it is NOT
+# referenced by the app-of-apps root Application.
+#
+# Substituted by envsubst in the configure stage:
+#   ARGOCD_HOSTNAME     — from terraform output argocd_hostname
+#   ARGOCD_CERT_ARN     — from terraform output acm_certificate_arn
+#   ARGOCD_CIDR_LIST    — the allowlist as a bare comma-separated string
+#   PROJECT_NAME        — platform secret, for resource tagging
+#
+# NOTE ON ARGOCD_CIDR_LIST: the ARGOCD_ALLOWED_CIDRS secret holds HCL list
+# syntax (["1.2.3.4/32"]) because terraform consumes it as TF_VAR_. The ALB
+# annotation needs a bare comma-separated string. The configure stage strips
+# the brackets and quotes into ARGOCD_CIDR_LIST — do not substitute the raw
+# secret here, the controller would reject the malformed value.
+#
+# This file is only applied when the ACM certificate reports ISSUED. Attaching
+# an unissued certificate to an ALB listener fails, so the configure stage
+# checks the status first and skips this apply while validation is pending.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # THE SECURITY CONTROL.
+    #
+    # This annotation writes the allowlist into the ALB's security group, so
+    # traffic from anywhere else is refused at the load balancer and never
+    # reaches argocd-server. TLS protects the credential in transit; THIS is
+    # what stops the internet from reaching the login form at all.
+    #
+    # The Argo CD UI can change what runs in this cluster, read every Secret
+    # Argo manages, and repoint Applications at arbitrary Git repositories. It
+    # authenticates with a single password. Do not widen this to 0.0.0.0/0 —
+    # terraform's argocd_allowed_cidrs variable has a validation rule that
+    # rejects it, and that rule is intentional. If access is needed from
+    # unpredictable networks, add SSO/OIDC and set admin.enabled=false.
+    alb.ingress.kubernetes.io/inbound-cidrs: "${ARGOCD_CIDR_LIST}"
+
+    # TLS terminates here at the ALB. argocd-server runs with
+    # configs.params.server.insecure=true (already set on the Helm release),
+    # so it serves plain HTTP on port 80 and the connection is not
+    # double-wrapped in Argo's own self-signed certificate.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: ${ARGOCD_CERT_ARN}
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # Argo CD's UI holds long-lived websocket connections for live resource
+    # views; the 60s default idle timeout drops them and the UI reconnects
+    # noisily.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/tags: Project=${PROJECT_NAME},ManagedBy=udap
+spec:
+  ingressClassName: alb
+  rules:
+    - host: ${ARGOCD_HOSTNAME}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 80

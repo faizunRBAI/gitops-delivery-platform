@@ -2,14 +2,18 @@
 
 dev: Developer { shape: person; udap-type: generic.user }
 user: End User { shape: person; udap-type: generic.user }
+admin: Operator (118.179.34.201/32) { shape: person; udap-type: generic.user }
+dns: cPanel DNS royalbengal.xyz (manual CNAMEs) { udap-type: generic.cdn }
+acm: ACM Cert argocd.rbai.royalbengal.xyz (DNS validation) { udap-type: aws.acm }
 repo: GitHub Repo (app + chart + gitops + infra) { shape: cylinder; udap-type: generic.app }
 ci: GitHub Actions (test - security - image - provision - configure - verify) { udap-type: generic.app }
 ecr: ECR Repository { udap-type: aws.ecr }
 vpc: VPC 10.0.0.0/16 (public + private subnets) {
-  alb: Application Load Balancer (public subnets) { udap-type: aws.alb }
+  alb: App ALB (public subnets) { udap-type: aws.alb }
+  argoalb: Argo CD ALB - HTTPS 443 - SG locked to operator CIDR { udap-type: aws.alb }
   eks: EKS Control Plane gitops-delivery-platfor-eks { udap-type: aws.eks }
   nodes: Managed Node Group t3.medium x2 (private subnets) { udap-type: aws.ec2 }
-  argocd: Argo CD (namespace argocd) { udap-type: generic.app }
+  argocd: Argo CD (namespace argocd - server.insecure) { udap-type: generic.app }
   albc: AWS Load Balancer Controller (IRSA) { udap-type: generic.app }
   app: Spring Boot App (Helm chart - Deployment) { udap-type: generic.app }
 }
@@ -18,12 +22,19 @@ dev -> repo: git push
 repo -> ci: workflow_dispatch (platform trigger)
 ci -> ecr: build and push image tag=commit SHA
 ci -> vpc.eks: terraform apply - cluster and node group
-ci -> vpc.argocd: helm install argocd - apply root-app
+ci -> acm: request cert - output validation CNAME
+dns -> acm: operator adds validation CNAME
+ci -> vpc.argocd: helm install argocd - apply root-app - apply ingress
 ci -> vpc.app: kubectl patch Application - image tag parameter
 vpc.argocd -> repo: poll gitops/ and chart/ (desired state)
 vpc.argocd -> vpc.app: sync - prune - selfHeal
 vpc.nodes -> ecr: pull image
 vpc.albc -> vpc.alb: provision from Ingress
+vpc.albc -> vpc.argoalb: provision from Ingress
+admin -> dns: resolve argocd.rbai.royalbengal.xyz
+admin -> vpc.argoalb: HTTPS 443 (inbound-cidrs allowlist)
+vpc.argoalb -> vpc.argocd: HTTP 80 to argocd-server
+acm -> vpc.argoalb: TLS certificate
 user -> vpc.alb: HTTP
 vpc.alb -> vpc.app: route to Service
 vpc.eks -> vpc.nodes: schedules pods

@@ -20,6 +20,33 @@ variable "cluster_public_access_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
+# NOTE: argocd_allowed_cidrs below is a DIFFERENT exposure from
+# cluster_public_access_cidrs above and must not be confused with it. That one
+# governs the EKS API endpoint (IAM-authenticated, accepted exception
+# AVD-AWS-0040/0041). This one governs the Argo CD web UI, which authenticates
+# with a PASSWORD — a single factor in front of cluster-admin authority. It has
+# no default on purpose.
+variable "argocd_allowed_cidrs" {
+  description = "Source CIDRs permitted to reach the Argo CD UI load balancer. Written into the ALB security group via the ingress inbound-cidrs annotation. Supplied as TF_VAR_argocd_allowed_cidrs from the ARGOCD_ALLOWED_CIDRS pipeline secret so the operator's home IP is not published in this public repository. INTENTIONALLY HAS NO DEFAULT: a missing value must fail the apply loudly rather than quietly defaulting to an open endpoint. Do not add a default, and do not set this to 0.0.0.0/0 — the Argo CD UI can change what runs in the cluster and read every Secret Argo manages. If access is needed from unpredictable networks, the correct change is SSO/OIDC with admin.enabled=false, not a wider CIDR."
+  type        = list(string)
+
+  validation {
+    condition     = !contains(var.argocd_allowed_cidrs, "0.0.0.0/0")
+    error_message = "argocd_allowed_cidrs must not contain 0.0.0.0/0. The Argo CD UI holds cluster-admin authority behind a single password; exposing it to the internet is not a supported configuration. Use a specific CIDR, or switch to SSO/OIDC with admin.enabled=false."
+  }
+
+  validation {
+    condition     = length(var.argocd_allowed_cidrs) > 0
+    error_message = "argocd_allowed_cidrs must contain at least one CIDR."
+  }
+}
+
+variable "argocd_hostname" {
+  description = "Fully-qualified hostname for the Argo CD UI. An ACM certificate is requested for this name; DNS for the zone is hosted in cPanel, so the validation CNAME and the final ALB CNAME are added manually by the operator."
+  type        = string
+  default     = "argocd.rbai.royalbengal.xyz"
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the dedicated VPC."
   type        = string

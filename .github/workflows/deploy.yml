@@ -50,6 +50,7 @@ jobs:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
+      TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@v4
@@ -81,6 +82,30 @@ jobs:
     - name: Terraform apply
       run: terraform apply -input=false -auto-approve
       working-directory: infra
+    - name: Report the ACM certificate status and validation record
+      run: "set -euo pipefail\n# The certificate is requested but NOT waited on (see\
+        \ infra/acm.tf):\n# DNS for this zone lives in cPanel, so terraform cannot\
+        \ write the\n# validation record and aws_acm_certificate_validation would\
+        \ block\n# the apply for hours. Print what the operator needs instead.\nSTATUS=\"\
+        $(terraform output -raw acm_certificate_status)\"\necho \"ACM certificate\
+        \ status: $STATUS\"\nif [ \"$STATUS\" = \"ISSUED\" ]; then\n  echo \"Certificate\
+        \ is issued - the Argo CD ingress will be created by configure.\"\n  exit\
+        \ 0\nfi\nNAME=\"$(terraform output -raw acm_validation_name)\"\nVALUE=\"$(terraform\
+        \ output -raw acm_validation_value)\"\nHOSTNAME=\"$(terraform output -raw\
+        \ argocd_hostname)\"\nZONE=\"${HOSTNAME#*.}\"\nSHORT=\"${NAME%.${ZONE}.}\"\
+        \necho \"===================================================================\"\
+        \necho \"ACTION REQUIRED - add this CNAME in the cPanel Zone Editor\"\necho\
+        \ \"===================================================================\"\n\
+        echo \"Record type                 : CNAME\"\necho \"Fully-qualified record\
+        \ name : ${NAME}\"\necho \"Record value                : ${VALUE}\"\necho\n\
+        echo \"cPanel usually APPENDS the zone (${ZONE}) to whatever you type.\"\n\
+        echo \"If so, enter ONLY this in the Name field:\"\necho \"  ${SHORT}\"\n\
+        echo\necho \"Verify afterwards with:\"\necho \"  dig +short CNAME ${NAME}\"\
+        \necho \"It must return exactly: ${VALUE}\"\necho\necho \"A doubled zone suffix\
+        \ (\u2026${ZONE}.${ZONE}) is the usual cPanel\"\necho \"mistake and makes\
+        \ validation silently never complete.\"\necho \"===================================================================\"\
+        \n"
+      working-directory: infra
   image:
     runs-on: ubuntu-latest
     needs:
@@ -91,6 +116,7 @@ jobs:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
+      TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
     timeout-minutes: 30
     steps:
@@ -143,8 +169,11 @@ jobs:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
+      TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
       GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+      ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
+      ARGOCD_ADMIN_PASSWORD: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@v4
@@ -167,7 +196,9 @@ jobs:
         \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\nterraform\
         \ output -raw cluster_name > /tmp/cluster_name\nterraform output -raw alb_controller_role_arn\
         \ > /tmp/albc_role_arn\nterraform output -raw ecr_repository_url > /tmp/ecr_url\n\
-        terraform output -raw vpc_id > /tmp/vpc_id\n"
+        terraform output -raw vpc_id > /tmp/vpc_id\nterraform output -raw acm_certificate_arn\
+        \ > /tmp/acm_arn\nterraform output -raw acm_certificate_status > /tmp/acm_status\n\
+        terraform output -raw argocd_hostname > /tmp/argocd_hostname\n"
       working-directory: infra
     - name: Update kubeconfig
       run: 'set -euo pipefail
@@ -183,6 +214,29 @@ jobs:
         \ | kubectl apply -f -\nhelm upgrade --install argocd argo/argo-cd \\\n  --namespace\
         \ argocd \\\n  --version 7.7.11 \\\n  --set configs.params.\"server\\.insecure\"\
         =true \\\n  --wait --timeout 15m\n"
+    - name: Rotate the Argo CD admin password off the initial secret
+      run: "set -euo pipefail\n# argocd-initial-admin-secret holds an auto-generated\
+        \ cluster-admin\n# password in plaintext in a namespace Secret, readable by\
+        \ anyone with\n# `kubectl get secret -n argocd`. It is a bootstrap artifact,\
+        \ not a\n# credential store. Replace it with a value held as a repository\n\
+        # secret, and delete the bootstrap secret so there is exactly one\n# source\
+        \ of truth.\n#\n# Argo CD reads the bcrypt hash from argocd-secret key\n#\
+        \ admin.password. htpasswd -B is bcrypt; -C 10 matches Argo's own\n# default\
+        \ cost. Writing admin.passwordMtime alongside it is REQUIRED:\n# Argo compares\
+        \ that timestamp against issued JWTs and invalidates\n# sessions older than\
+        \ the change, so omitting it would leave tokens\n# minted under the OLD password\
+        \ valid indefinitely.\nif ! command -v htpasswd >/dev/null 2>&1; then\n  sudo\
+        \ apt-get update -qq\n  sudo apt-get install -y -qq apache2-utils\nfi\nHASH=\"\
+        $(htpasswd -nbBC 10 \"\" \"$ARGOCD_ADMIN_PASSWORD\" | tr -d ':\\n' | sed 's/^\\\
+        $2y/\\$2a/')\"\nMTIME=\"$(date -u +%FT%TZ)\"\nkubectl -n argocd patch secret\
+        \ argocd-secret \\\n  -p \"{\\\"stringData\\\":{\\\"admin.password\\\":\\\"\
+        ${HASH}\\\",\\\"admin.passwordMtime\\\":\\\"${MTIME}\\\"}}\"\n# Idempotent:\
+        \ absent on every run after the first.\nkubectl -n argocd delete secret argocd-initial-admin-secret\
+        \ --ignore-not-found\n# argocd-server caches the credential; restart so the\
+        \ new hash is live\n# before the verify stage or the operator tries to log\
+        \ in.\nkubectl -n argocd rollout restart deployment argocd-server\nkubectl\
+        \ -n argocd rollout status deployment argocd-server --timeout=5m\necho \"\
+        admin password rotated; argocd-initial-admin-secret removed\"\n"
     - name: Install AWS Load Balancer Controller
       run: "set -euo pipefail\nkubectl apply --server-side -f https://raw.githubusercontent.com/aws/eks-charts/v0.0.187/stable/aws-load-balancer-controller/crds/crds.yaml\n\
         helm repo add eks https://aws.github.io/eks-charts\nhelm repo update\nhelm\
@@ -193,6 +247,42 @@ jobs:
         \  --set serviceAccount.name=aws-load-balancer-controller \\\n  --set serviceAccount.annotations.\"\
         eks\\.amazonaws\\.com/role-arn\"=\"$(cat /tmp/albc_role_arn)\" \\\n  --wait\
         \ --timeout 10m\n"
+    - name: Create the Argo CD UI ingress once the certificate is issued
+      run: "set -euo pipefail\nSTATUS=\"$(cat /tmp/acm_status)\"\nHOSTNAME=\"$(cat\
+        \ /tmp/argocd_hostname)\"\nif [ \"$STATUS\" != \"ISSUED\" ]; then\n  # PHASE\
+        \ 1. Attaching an unissued certificate to an ALB listener\n  # fails, so skip\
+        \ the ingress rather than failing the deploy. The\n  # provision stage printed\
+        \ the validation CNAME to add in cPanel.\n  # This is a normal, successful\
+        \ outcome of the first deploy.\n  echo \"ACM certificate status is ${STATUS},\
+        \ not ISSUED.\"\n  echo \"Skipping the Argo CD ingress - it will be created\
+        \ on the next\"\n  echo \"deploy, once the validation CNAME is live and ACM\
+        \ has issued.\"\n  echo \"Use kubectl port-forward for UI access in the meantime:\"\
+        \n  echo \"  kubectl -n argocd port-forward svc/argocd-server 8080:443\"\n\
+        \  exit 0\nfi\n# PHASE 2. Certificate is issued; create the front door.\n\
+        #\n# FORMAT CONVERSION. The ARGOCD_ALLOWED_CIDRS secret holds HCL list\n#\
+        \ syntax ([\"1.2.3.4/32\"]) because terraform consumes the same secret\n#\
+        \ as TF_VAR_argocd_allowed_cidrs. The ALB annotation needs a bare\n# comma-separated\
+        \ string. Strip brackets, quotes and spaces.\nARGOCD_CIDR_LIST=\"$(printf\
+        \ '%s' \"$ARGOCD_ALLOWED_CIDRS\" \\\n  | tr -d '[]\" ' )\"\n# Refuse to render\
+        \ an ingress with an empty allowlist. The ALB\n# controller treats a missing\
+        \ inbound-cidrs annotation as \"no\n# restriction\" - an open admin console,\
+        \ the exact outcome this\n# design exists to prevent. Fail loudly instead.\n\
+        if [ -z \"$ARGOCD_CIDR_LIST\" ]; then\n  echo \"ERROR: the resolved CIDR allowlist\
+        \ is empty.\"\n  echo \"Refusing to create an internet-facing ingress for\
+        \ the Argo CD\"\n  echo \"admin UI without a source allowlist. Check that\
+        \ the\"\n  echo \"ARGOCD_ALLOWED_CIDRS secret is set to an HCL list, e.g.\"\
+        \n  echo '  [\"203.0.113.10/32\"]'\n  exit 1\nfi\n# Belt and braces: the terraform\
+        \ variable already rejects 0.0.0.0/0\n# at plan time, but this file is applied\
+        \ with kubectl and would not\n# be caught by that if the two ever drifted\
+        \ apart.\ncase \",$ARGOCD_CIDR_LIST,\" in\n  *,0.0.0.0/0,*)\n    echo \"ERROR:\
+        \ allowlist contains 0.0.0.0/0.\"\n    echo \"The Argo CD UI holds cluster-admin\
+        \ authority behind a single\"\n    echo \"password. Exposing it to the internet\
+        \ is not a supported\"\n    echo \"configuration. Use SSO/OIDC with admin.enabled=false\
+        \ if\"\n    echo \"access from arbitrary networks is required.\"\n    exit\
+        \ 1\n    ;;\nesac\nexport ARGOCD_HOSTNAME=\"$HOSTNAME\"\nexport ARGOCD_CERT_ARN=\"\
+        $(cat /tmp/acm_arn)\"\nexport ARGOCD_CIDR_LIST\nexport PROJECT_NAME\nenvsubst\
+        \ < gitops/argocd-ingress.yaml | kubectl apply -f -\necho \"Argo CD ingress\
+        \ applied for ${HOSTNAME}\"\n"
     - name: Confirm the GitOps repository is anonymously readable
       run: "set -euo pipefail\n# This repository is PUBLIC by deliberate choice, so\
         \ Argo CD clones it\n# anonymously and no repository-credential Secret exists.\
@@ -255,6 +345,7 @@ jobs:
       AWS_REGION: us-east-1
       TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
       TF_VAR_aws_region: us-east-1
+      TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
@@ -270,7 +361,8 @@ jobs:
       run: "set -euo pipefail\nterraform init -input=false -reconfigure \\\n  -backend-config=\"\
         bucket=${{ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
         \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\nterraform\
-        \ output -raw cluster_name > /tmp/cluster_name\n"
+        \ output -raw cluster_name > /tmp/cluster_name\nterraform output -raw acm_certificate_status\
+        \ > /tmp/acm_status\nterraform output -raw argocd_hostname > /tmp/argocd_hostname\n"
       working-directory: infra
     - name: Update kubeconfig
       run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
@@ -299,4 +391,27 @@ jobs:
         \ for ingress hostname\"\n    kubectl get ingress -n app-dev\n    exit 1\n\
         \  fi\n  sleep 15\ndone\necho \"ingress hostname: $HOST\"\ncurl --fail --show-error\
         \ --silent --retry 20 --retry-delay 15 --retry-all-errors \\\n  \"http://${HOST}/actuator/health\"\
+        \n"
+    - name: Report the Argo CD UI endpoint
+      run: "set -euo pipefail\nSTATUS=\"$(cat /tmp/acm_status)\"\nHOSTNAME=\"$(cat\
+        \ /tmp/argocd_hostname)\"\nif [ \"$STATUS\" != \"ISSUED\" ]; then\n  echo\
+        \ \"Argo CD UI ingress not created yet (certificate ${STATUS}).\"\n  echo\
+        \ \"Add the validation CNAME printed by the provision stage, then\"\n  echo\
+        \ \"run the deploy again. Until then, reach the UI with:\"\n  echo \"  kubectl\
+        \ -n argocd port-forward svc/argocd-server 8080:443\"\n  exit 0\nfi\n# Wait\
+        \ for the ALB controller to publish the load balancer hostname,\n# then report\
+        \ BOTH names: the ALB hostname is what the operator must\n# CNAME to in cPanel.\n\
+        DEADLINE=$((SECONDS + 600))\nwhile true; do\n  ALB=\"$(kubectl get ingress\
+        \ argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'\
+        \ 2>/dev/null || true)\"\n  if [ -n \"$ALB\" ]; then\n    break\n  fi\n  if\
+        \ [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n    echo \"timed out waiting for\
+        \ the Argo CD ALB hostname\"\n    kubectl describe ingress argocd-server -n\
+        \ argocd\n    exit 1\n  fi\n  sleep 15\ndone\necho \"===================================================================\"\
+        \necho \"Argo CD UI: https://${HOSTNAME}\"\necho \"ALB hostname: ${ALB}\"\n\
+        echo\necho \"If https://${HOSTNAME} does not resolve yet, add this in cPanel:\"\
+        \necho \"  Type  : CNAME\"\necho \"  Name  : ${HOSTNAME%%.*}\"\necho \"  Value\
+        \ : ${ALB}\"\necho\necho \"Reachable ONLY from the allowlisted source CIDR.\
+        \ Any other\"\necho \"source is refused by the ALB security group and will\
+        \ simply\"\necho \"time out - that is the control working, not an outage.\"\
+        \necho \"===================================================================\"\
         \n"
