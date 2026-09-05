@@ -1,10 +1,22 @@
-{{- if .Values.ingress.enabled }}
 {{/*
 The AWS Load Balancer Controller provisions a real ALB from this Ingress. It
 finds the public subnets via the kubernetes.io/role/elb=1 tags that infra/vpc.tf
 puts on them; without ingressClassName the controller ignores the object
 entirely and the Ingress stays pending forever.
+
+TWO conditions gate this object:
+
+  1. ingress.enabled — app-bluegreen and app-canary set it FALSE. Every enabled
+     Ingress provisions a separate billable ALB with a public endpoint, and the
+     progressive-delivery instances are exercised in-cluster.
+
+  2. no Rollout — the plain Service this Ingress points at does not exist when a
+     Rollout owns the pods, so the Ingress would reference a missing backend and
+     the ALB controller would fail to build a target group. Exposing a blue/green
+     app externally means pointing an Ingress at the ACTIVE Service specifically;
+     that is a deliberate design step, not something to inherit by default.
 */}}
+{{- if and .Values.ingress.enabled (not (include "app.rolloutEnabled" .)) }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

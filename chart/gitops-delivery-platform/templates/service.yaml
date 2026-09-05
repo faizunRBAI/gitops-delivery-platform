@@ -1,3 +1,19 @@
+{{/*
+The PLAIN Service — the counterpart of templates/deployment.yaml.
+
+Suppressed whenever a Rollout owns the pods. Under blue/green the active and
+preview Services (templates/rollout-services.yaml) do this job and have their
+selectors managed by the Rollouts controller; a third Service selecting the same
+pods would route to BOTH ReplicaSets at once and quietly defeat the point of a
+preview environment.
+
+Canary keeps no extra Service, but it is suppressed there too: with no traffic
+router configured a canary shifts pod proportions, and a Service in front of all
+of them is the intended behaviour of the ingress-less in-cluster setup — if you
+later add external routing for canary, add it deliberately rather than
+inheriting it from Phase 1.
+*/}}
+{{- if not (include "app.rolloutEnabled" .) }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,3 +29,4 @@ spec:
       name: http
   selector:
     {{- include "app.selectorLabels" . | nindent 4 }}
+{{- end }}

@@ -239,6 +239,10 @@ stages:
       GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       ARGOCD_ADMIN_PASSWORD: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+      # Argo Rollouts controller version. Pinned for the same reason every chart
+      # here is pinned: an unpinned "latest" manifest changes the CRD schema
+      # under a running cluster with no commit to point at.
+      ARGO_ROLLOUTS_VERSION: v1.7.2
     steps:
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -284,6 +288,46 @@ stages:
             --version 7.7.11 \
             --set configs.params."server\.insecure"=true \
             --wait --timeout 15m
+      - name: Install or upgrade the Argo Rollouts controller
+        run: |
+          set -euo pipefail
+          # WHY THIS RUNS BEFORE THE ROOT APPLICATION IS APPLIED.
+          #
+          # app-bluegreen and app-canary render a `kind: Rollout`. A CRD that
+          # does not exist yet makes the API server REJECT the object, and Argo
+          # CD surfaces that as a sync failure on the child Application - which
+          # looks identical to a broken chart. Installing the controller first
+          # means the CRDs are registered before anything tries to create one.
+          #
+          # INSTALLED WITH kubectl, NOT HELM, and deliberately so: this is the
+          # upstream release manifest (the install path Argo Rollouts documents
+          # first), it carries its own CRDs, and there is no values file worth
+          # maintaining for a stock controller. Keeping it out of Helm also
+          # keeps it out of any future `helm list` cleanup that walks releases.
+          #
+          # IDEMPOTENT: `create namespace --dry-run=client | apply` is the
+          # standard create-or-noop, and --server-side apply reconciles an
+          # existing install in place rather than erroring on conflict.
+          # --force-conflicts lets a later version take ownership of fields a
+          # previous client-side apply wrote, which is the usual upgrade snag.
+          #
+          # The CRDs are LARGE (well past the 262144-byte annotation limit that
+          # client-side apply imposes), so --server-side is required here, not
+          # merely preferred.
+          kubectl create namespace argo-rollouts --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply --server-side --force-conflicts \
+            -n argo-rollouts \
+            -f "https://github.com/argoproj/argo-rollouts/releases/download/${ARGO_ROLLOUTS_VERSION}/install.yaml"
+          # Block until the CRD is actually registered and the controller is
+          # serving. Applying a Rollout against a half-registered CRD fails with
+          # "no matches for kind", which is a confusing way to learn about a
+          # race that a single wait removes.
+          kubectl wait --for=condition=established --timeout=120s \
+            crd/rollouts.argoproj.io
+          kubectl wait --for=condition=established --timeout=120s \
+            crd/analysistemplates.argoproj.io
+          kubectl -n argo-rollouts rollout status deployment/argo-rollouts --timeout=5m
+          echo "Argo Rollouts ${ARGO_ROLLOUTS_VERSION} is installed and established"
       - name: Rotate the Argo CD admin password off the initial secret
         run: |
           set -euo pipefail
@@ -418,32 +462,70 @@ stages:
           set -euo pipefail
           export GITOPS_REPO_URL
           envsubst < gitops/root-app.yaml | kubectl apply -f -
-      - name: Patch app-dev image tag onto the Application
+      - name: Patch the image tag onto every application
         run: |
           set -euo pipefail
           ECR_URL="$(cat /tmp/ecr_url)"
-          # The root Application creates app-dev; wait for it to exist before
-          # patching. This is cluster state - the repository is not modified.
-          DEADLINE=$((SECONDS + 300))
-          until kubectl get application app-dev -n argocd >/dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "app-dev Application was not created by the root app in time"
-              kubectl get applications -n argocd
-              exit 1
-            fi
-            sleep 10
+          # The root Application creates the children; wait for each to exist
+          # before patching. This is cluster state - the repository is never
+          # modified, which is what lets selfHeal stay on permanently.
+          #
+          # BOTH parameters are always sent together. The patch is a MERGE patch
+          # and `parameters` is a LIST, so a merge REPLACES the whole list
+          # rather than adding to it. Sending image.tag alone would delete
+          # image.repository and the chart's `app.image` helper would fail the
+          # render with "image.repository is empty".
+          for APP in app-dev app-bluegreen app-canary; do
+            echo "--- $APP"
+            DEADLINE=$((SECONDS + 300))
+            until kubectl get application "$APP" -n argocd >/dev/null 2>&1; do
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                echo "Application $APP was not created by the root app in time"
+                kubectl get applications -n argocd
+                exit 1
+              fi
+              sleep 10
+            done
+            kubectl patch application "$APP" --namespace argocd --type merge \
+              --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${GITHUB_SHA}\"}]}}}}"
+            echo "patched $APP to ${GITHUB_SHA}"
           done
-          kubectl patch application app-dev --namespace argocd --type merge \
-            --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${GITHUB_SHA}\"}]}}}}"
+      - name: Refresh the repo-server cache so the patch is rendered
+        run: |
+          set -euo pipefail
+          # THE ORDERING ARTEFACT THIS CLOSES.
+          #
+          # On a fresh cluster the root Application creates each child with an
+          # empty `parameters: []`. Argo CD renders it immediately, the chart's
+          # image guard fails, and the repo-server CACHES that failure. The
+          # patch above then lands - but Argo keeps serving the STALE cached
+          # error once its retry backoff is spent, and the Application sits at
+          # sync=Unknown with a ComparisonError reading "(cached)".
+          #
+          # That exact state was previously cleared BY HAND with this same
+          # restart. Doing it here makes the fix part of the deploy instead of
+          # tribal knowledge. It is cheap and harmless when nothing was cached.
+          #
+          # A hard refresh annotation alone is NOT sufficient: it re-renders but
+          # can still be served from the failed-render cache. Restarting the
+          # repo-server empties that cache outright.
+          kubectl -n argocd rollout restart deployment argocd-repo-server
+          kubectl -n argocd rollout status deployment argocd-repo-server --timeout=5m
+          # Ask each Application to re-compare against a freshly rendered source.
+          for APP in app-dev app-bluegreen app-canary; do
+            kubectl -n argocd annotate application "$APP" \
+              argocd.argoproj.io/refresh=hard --overwrite
+          done
+          echo "repo-server cache cleared and a hard refresh requested"
       - name: Confirm the image parameters survived root's reconciliation
         run: |
           set -euo pipefail
-          # The patch above writes CLUSTER state onto an object that the ROOT
-          # Application manages from Git, where it is rendered with an empty
+          # The patch above writes CLUSTER state onto objects that the ROOT
+          # Application manages from Git, where they are rendered with an empty
           # `parameters: []`. root therefore has ignoreDifferences on
-          # /spec/source/helm/parameters - without it, selfHeal reverts this
-          # patch within seconds and app-dev sits at sync=Unknown forever with
-          # "image.repository is empty" (that is exactly how the previous deploy
+          # /spec/source/helm/parameters - without it, selfHeal reverts the
+          # patch within seconds and the child sits at sync=Unknown forever with
+          # "image.repository is empty" (that is exactly how a previous deploy
           # failed).
           #
           # ignoreDifferences is easy to attach to the wrong Application and
@@ -452,18 +534,20 @@ stages:
           # is not instantaneous.
           DEADLINE=$((SECONDS + 180))
           while true; do
-            TAG="$(kubectl get application app-dev -n argocd \
-              -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
-            if [ "$TAG" != "$GITHUB_SHA" ]; then
-              echo "ERROR: image.tag on app-dev is '${TAG:-<empty>}', expected the commit SHA."
-              echo "The root Application reverted the patch, which means its"
-              echo "ignoreDifferences for /spec/source/helm/parameters is missing"
-              echo "or attached to the wrong Application."
-              kubectl get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'
-              exit 1
-            fi
+            for APP in app-dev app-bluegreen app-canary; do
+              TAG="$(kubectl get application "$APP" -n argocd \
+                -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+              if [ "$TAG" != "$GITHUB_SHA" ]; then
+                echo "ERROR: image.tag on ${APP} is '${TAG:-<empty>}', expected the commit SHA."
+                echo "The root Application reverted the patch, which means its"
+                echo "ignoreDifferences for /spec/source/helm/parameters is missing"
+                echo "or attached to the wrong Application."
+                kubectl get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'
+                exit 1
+              fi
+            done
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "OK: image parameters stable on app-dev for 180s"
+              echo "OK: image parameters stable on all applications for 180s"
               break
             fi
             sleep 15
@@ -506,7 +590,7 @@ stages:
       - name: Wait for Argo CD Applications to be Synced and Healthy
         run: |
           set -euo pipefail
-          for APP in root app-dev; do
+          for APP in root app-dev app-bluegreen app-canary; do
             echo "waiting for Application/$APP"
             DEADLINE=$((SECONDS + 600))
             while true; do
@@ -525,7 +609,9 @@ stages:
                 echo "timed out waiting for $APP (sync=$SYNC health=$HEALTH)"
                 # sync=Unknown means Argo could not RENDER the source. The
                 # ComparisonError condition carries the helm template error and
-                # is far more useful than the describe output alone.
+                # is far more useful than the describe output alone. A "(cached)"
+                # prefix means a STALE failed render - the configure stage's
+                # repo-server restart is what clears it.
                 kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
                 echo
                 kubectl describe application "$APP" -n argocd
@@ -534,6 +620,45 @@ stages:
               sleep 15
             done
           done
+      - name: Confirm the Rollout workloads reached a stable state
+        run: |
+          set -euo pipefail
+          # A blue/green Rollout with autoPromotionEnabled=false PAUSES at
+          # `Paused` on its FIRST revision by design, waiting for a human
+          # promotion. Treat Healthy and Paused as acceptable resting states and
+          # fail only on Degraded - otherwise every first deploy of the
+          # blue/green instance would "fail" while behaving exactly as designed.
+          for NS in app-bluegreen app-canary; do
+            echo "--- namespace $NS"
+            DEADLINE=$((SECONDS + 600))
+            while true; do
+              PHASE="$(kubectl get rollout -n "$NS" \
+                -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+              echo "  rollout phase=${PHASE:-<none>}"
+              case "$PHASE" in
+                Healthy|Paused)
+                  echo "  OK ($PHASE)"
+                  break
+                  ;;
+                Degraded)
+                  echo "rollout in $NS is Degraded"
+                  kubectl describe rollout -n "$NS"
+                  kubectl get pods -n "$NS"
+                  exit 1
+                  ;;
+              esac
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                echo "timed out waiting for the rollout in $NS (phase=${PHASE:-<none>})"
+                kubectl describe rollout -n "$NS"
+                kubectl get pods -n "$NS"
+                exit 1
+              fi
+              sleep 15
+            done
+          done
+          echo
+          echo "Blue/green promotion is MANUAL by design. To promote:"
+          echo "  kubectl argo rollouts promote <rollout> -n app-bluegreen"
       - name: Resolve ingress endpoint and curl the service
         run: |
           set -euo pipefail
@@ -610,3 +735,180 @@ stages:
 
 rollback:
   strategy: manual
+
+# ---------------------------------------------------------------------------
+# EXTRA WORKFLOWS
+#
+# Rendered to .github/workflows/<id>.yml as standalone workflow_dispatch
+# workflows. No provision/configure/verify backbone is required here.
+# ---------------------------------------------------------------------------
+pipelines:
+  - id: rollback
+    stages:
+      - id: rollback
+        kind: custom
+        needs: []
+        timeout_minutes: 20
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          # HOW THE OPERATOR SUPPLIES THE TARGET.
+          #
+          # Through REPOSITORY VARIABLES, not workflow_dispatch inputs. The
+          # platform renders every workflow with a bare `workflow_dispatch: {}`
+          # and the pipeline spec has no field for declaring `inputs:` - so
+          # `${{ inputs.* }}` would silently resolve to an empty string on every
+          # run and this workflow could never roll anything back.
+          #
+          # Repository variables are the mechanism that DOES work from the spec:
+          #   Settings -> Secrets and variables -> Actions -> Variables
+          #     ROLLBACK_IMAGE_TAG   (required) the commit SHA to roll back to
+          #     ROLLBACK_APPLICATION (optional) app-dev | app-bluegreen | app-canary
+          #                                     defaults to app-dev
+          # Set the variable, then run this workflow. Both are plain config, not
+          # credentials, so a variable (visible, editable, auditable) is the
+          # right home for them rather than a secret.
+          ROLLBACK_APP: ${{ vars.ROLLBACK_APPLICATION }}
+          ROLLBACK_TAG: ${{ vars.ROLLBACK_IMAGE_TAG }}
+        steps:
+          - name: Set up Terraform
+            uses: hashicorp/setup-terraform@v3
+            with:
+              terraform_version: 1.9.8
+          - name: Set up kubectl
+            uses: azure/setup-kubectl@v4
+            with:
+              version: v1.33.0
+          - name: Resolve and validate the rollback target
+            run: |
+              set -euo pipefail
+              # Default the application so the common case needs ONE variable.
+              APP="${ROLLBACK_APP:-app-dev}"
+              if [ -z "${ROLLBACK_TAG:-}" ]; then
+                echo "ERROR: the ROLLBACK_IMAGE_TAG repository variable is not set."
+                echo
+                echo "Set it under:"
+                echo "  Settings -> Secrets and variables -> Actions -> Variables"
+                echo
+                echo "  ROLLBACK_IMAGE_TAG   = <the commit SHA to roll back to>"
+                echo "  ROLLBACK_APPLICATION = app-dev | app-bluegreen | app-canary"
+                echo "                         (optional, defaults to app-dev)"
+                echo
+                echo "Then run this workflow again."
+                exit 1
+              fi
+              case "$APP" in
+                app-dev|app-bluegreen|app-canary) ;;
+                *)
+                  echo "ERROR: ROLLBACK_APPLICATION must be one of"
+                  echo "  app-dev, app-bluegreen, app-canary"
+                  echo "Got: '${APP}'"
+                  exit 1
+                  ;;
+              esac
+              echo "APP=${APP}" >> "$GITHUB_ENV"
+              echo "rollback target: ${APP} -> ${ROLLBACK_TAG}"
+          - name: Read infrastructure outputs from terraform state
+            run: |
+              set -euo pipefail
+              # Self-sufficient job (this workflow has no provision stage to
+              # inherit from): same backend flags, read what we need from state.
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+              terraform output -raw cluster_name > /tmp/cluster_name
+              terraform output -raw ecr_repository_url > /tmp/ecr_url
+            working-directory: infra
+          - name: Confirm the requested tag exists in ECR
+            run: |
+              set -euo pipefail
+              # FAIL BEFORE TOUCHING THE CLUSTER. Patching an Application to a
+              # tag that was never pushed produces ImagePullBackOff on every new
+              # pod - a broken deployment created BY the rollback that was meant
+              # to fix one. Checking ECR first turns that into a clean refusal.
+              if ! aws ecr describe-images --region "$AWS_REGION" \
+                     --repository-name "$PROJECT_NAME" \
+                     --image-ids imageTag="$ROLLBACK_TAG" >/dev/null 2>&1; then
+                echo "ERROR: no image tagged '${ROLLBACK_TAG}' exists in ECR."
+                echo "Recently pushed tags (oldest to newest):"
+                aws ecr describe-images --region "$AWS_REGION" \
+                  --repository-name "$PROJECT_NAME" \
+                  --query 'sort_by(imageDetails,&imagePushedAt)[-20:].imageTags[0]' \
+                  --output text
+                exit 1
+              fi
+              echo "OK: ${ROLLBACK_TAG} exists in ECR"
+          - name: Update kubeconfig
+            run: |
+              set -euo pipefail
+              aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
+              kubectl cluster-info
+          - name: Patch the Application back to the requested tag
+            run: |
+              set -euo pipefail
+              ECR_URL="$(cat /tmp/ecr_url)"
+              # Record what we are moving away from, so the log alone is enough
+              # to undo the rollback.
+              PREVIOUS="$(kubectl get application "$APP" -n argocd \
+                -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+              echo "rolling ${APP}: ${PREVIOUS:-<unset>} -> ${ROLLBACK_TAG}"
+              # BOTH parameters again - a merge patch replaces the whole list,
+              # so omitting image.repository would blank it and fail the render.
+              kubectl patch application "$APP" --namespace argocd --type merge \
+                --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${ROLLBACK_TAG}\"}]}}}}"
+              {
+                echo "### Rollback"
+                echo ""
+                echo "| field | value |"
+                echo "| --- | --- |"
+                echo "| application | \`${APP}\` |"
+                echo "| previous tag | \`${PREVIOUS:-<unset>}\` |"
+                echo "| rolled to | \`${ROLLBACK_TAG}\` |"
+                echo ""
+                echo "To undo, set ROLLBACK_IMAGE_TAG to the previous tag and re-run."
+              } >> "$GITHUB_STEP_SUMMARY"
+          - name: Wait for the application to converge on the rolled-back tag
+            run: |
+              set -euo pipefail
+              # Prove the rollback took effect rather than reporting success on
+              # a patch that selfHeal may have reverted.
+              DEADLINE=$((SECONDS + 600))
+              while true; do
+                TAG="$(kubectl get application "$APP" -n argocd \
+                  -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+                SYNC="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)"
+                HEALTH="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)"
+                echo "  tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH"
+                if [ "$TAG" != "$ROLLBACK_TAG" ]; then
+                  echo "ERROR: image.tag reverted to '${TAG:-<empty>}'."
+                  echo "The root Application's ignoreDifferences for"
+                  echo "/spec/source/helm/parameters is missing or misattached."
+                  exit 1
+                fi
+                if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                  echo "rollback complete: ${APP} is Synced and Healthy on ${ROLLBACK_TAG}"
+                  break
+                fi
+                if [ "$HEALTH" = "Degraded" ]; then
+                  echo "ERROR: ${APP} is Degraded after the rollback."
+                  kubectl describe application "$APP" -n argocd
+                  exit 1
+                fi
+                if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                  echo "timed out (sync=$SYNC health=$HEALTH)"
+                  kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
+                  exit 1
+                fi
+                sleep 15
+              done
+              echo
+              echo "NOTE for app-bluegreen: a rollback creates a new PREVIEW"
+              echo "ReplicaSet on the old tag and waits for promotion, because"
+              echo "autoPromotionEnabled is false. Promote it to take traffic:"
+              echo "  kubectl argo rollouts promote <rollout> -n app-bluegreen"

@@ -1,0 +1,66 @@
+{{- if not .Values.repoURL }}
+{{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
+{{- end }}
+# ---------------------------------------------------------------------------
+# app-canary — the same application chart, released with an Argo Rollouts
+# canary strategy, in its own namespace.
+#
+# Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
+# parameter. Nothing here hardcodes an org/repo pair.
+#
+# canary.enabled is set through `helm.values` rather than `parameters` ON
+# PURPOSE: the configure stage's merge patch REPLACES spec.source.helm.parameters
+# wholesale to inject the image tag, so a strategy flag stored there would be
+# silently wiped on the next deploy. `values` is a separate field.
+#
+# MUTUAL EXCLUSION: blueGreen.enabled stays at its false default here, and the
+# chart's `app.validateStrategy` helper fails the render if both are ever on.
+#
+# ingress.enabled=false: exercised in-cluster, no extra ALB.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-canary
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: {{ .Values.chartPath | quote }}
+    helm:
+      releaseName: app-canary
+      valueFiles:
+        - values.yaml
+      values: |
+        canary:
+          enabled: true
+        ingress:
+          enabled: false
+      parameters: []
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-canary
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
+  # A canary rollout deliberately runs a MIX of replica counts as it steps
+  # through its weights. Argo CD would read each intermediate state as drift and
+  # selfHeal would reset it, collapsing the canary before its pause elapsed.
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas

@@ -1,10 +1,14 @@
 # ---------------------------------------------------------------------------
-# Phase 1 renders a plain Deployment. The full values surface is written NOW so
-# Phase 2 (blue/green) and Phase 3 (canary) are a flag flip, not a chart rewrite.
+# DEFAULTS = the plain Deployment world (app-dev uses these unchanged).
 #
-# blueGreen.enabled and canary.enabled are MUTUALLY EXCLUSIVE. The Deployment
-# template renders only when BOTH are false; templates/NOTES and the helper
-# `validate-strategy` fail the render if both are switched on at once.
+# blueGreen.enabled and canary.enabled are MUTUALLY EXCLUSIVE and both default
+# to false, so this file renders a Deployment + Service + Ingress. The
+# app-bluegreen and app-canary Applications (gitops/apps/templates/) each flip
+# exactly one of them via an Argo CD Helm parameter.
+#
+# When either is on, an Argo Rollouts Rollout replaces the Deployment and the
+# `app.rolloutEnabled` helper suppresses the plain Service and Ingress. The
+# `app.validateStrategy` helper fails the render if both are switched on.
 # ---------------------------------------------------------------------------
 
 replicaCount: 2
@@ -32,6 +36,9 @@ service:
   targetPort: 8080
 
 ingress:
+  # Set FALSE by app-bluegreen and app-canary: each enabled Ingress provisions a
+  # separate billable ALB. Also force-suppressed whenever a Rollout is active,
+  # because the plain Service it targets does not render then.
   enabled: true
   className: alb
   annotations:
@@ -87,9 +94,18 @@ env:
   APP_NAME: gitops-delivery-platform
 
 # ---------------------------------------------------------------------------
-# PHASE 2 — Argo Rollouts blue/green. NOT installed in Phase 1.
-# Flipping this to true (with canary.enabled false) will render a Rollout with
-# preview/active Services instead of the plain Deployment.
+# Argo Rollouts — BLUE/GREEN.
+#
+# Enabled by the app-bluegreen Application. Two full ReplicaSets exist during a
+# release: the live one behind the ACTIVE service, the new one behind PREVIEW.
+#
+# activeService / previewService are SUFFIXES. The chart expands them against
+# the release fullname (helpers app.activeServiceName / app.previewServiceName)
+# and renders the matching Services in templates/rollout-services.yaml — the
+# Rollouts controller requires both to exist and does not create them.
+#
+# autoPromotionEnabled: false means the preview waits for a human:
+#   kubectl argo rollouts promote app-bluegreen-gitops-delivery-platform -n app-bluegreen
 # ---------------------------------------------------------------------------
 blueGreen:
   enabled: false
@@ -99,7 +115,17 @@ blueGreen:
   activeService: active
 
 # ---------------------------------------------------------------------------
-# PHASE 3 — Argo Rollouts canary. NOT installed in Phase 1.
+# Argo Rollouts — CANARY.
+#
+# Enabled by the app-canary Application. With no trafficRouting provider these
+# weights shift the PROPORTION OF PODS, not a precise share of requests: at
+# setWeight 20 with replicaCount 2, roughly one pod runs the new version.
+# Precise weighted routing needs an ALB traffic-router integration (optional
+# enhancement). The pauses are the real control — the rollout stops there until
+# the duration elapses, or indefinitely if you remove `duration`.
+#
+# analysis.enabled stays false: automatic promotion needs a metrics provider
+# (Prometheus) that this cluster does not run yet.
 # ---------------------------------------------------------------------------
 canary:
   enabled: false

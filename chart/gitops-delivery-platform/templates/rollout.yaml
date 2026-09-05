@@ -1,0 +1,110 @@
+{{- include "app.validateStrategy" . -}}
+{{/*
+PHASE 2 / PHASE 3 WORKLOAD — an Argo Rollouts Rollout.
+
+Renders ONLY when exactly one progressive-delivery strategy is enabled. The
+plain Deployment (templates/deployment.yaml) renders only when BOTH are off, so
+the two controllers can never own the same pods.
+
+The pod spec below is deliberately IDENTICAL to the Deployment's: same image
+helper, same probes, same securityContext, same writable /tmp. A Rollout is a
+drop-in replacement for a Deployment's spec — if these ever drift, a workload
+behaves differently depending on which strategy is switched on, which is the
+worst possible surprise during a release.
+
+REQUIRES the Argo Rollouts controller (installed by the configure stage into
+the argo-rollouts namespace). Without the CRD this object is rejected by the
+API server and the Application reports a sync error.
+*/}}
+{{- if or .Values.blueGreen.enabled .Values.canary.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  strategy:
+    {{- if .Values.blueGreen.enabled }}
+    blueGreen:
+      # Both Services must already exist — the controller does not create them.
+      # templates/rollout-services.yaml renders them alongside this object.
+      activeService: {{ include "app.activeServiceName" . }}
+      previewService: {{ include "app.previewServiceName" . }}
+      # autoPromotionEnabled=false means the new (preview) ReplicaSet is brought
+      # up and then WAITS for a human promotion. That is the whole point of
+      # blue/green here: verify the preview, then promote.
+      #   kubectl argo rollouts promote <name> -n <namespace>
+      autoPromotionEnabled: {{ .Values.blueGreen.autoPromotionEnabled }}
+      # Keep the old ReplicaSet alive briefly after promotion so in-flight
+      # requests drain and an instant un-promote is still possible.
+      scaleDownDelaySeconds: {{ .Values.blueGreen.scaleDownDelaySeconds }}
+    {{- else }}
+    canary:
+      # NOTE ON TRAFFIC: with no trafficRouting provider configured, these
+      # weights shift the PROPORTION OF PODS, not a precise share of requests.
+      # Real weighted routing needs an ALB/ingress traffic-router integration —
+      # listed as an optional enhancement. The pause steps still give a human
+      # (or, later, an AnalysisTemplate) a window to abort before full rollout.
+      steps:
+        {{- toYaml .Values.canary.steps | nindent 8 }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "app.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "app.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "app.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            - name: IMAGE_TAG
+              value: {{ .Values.image.tag | quote }}
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is on, so the JVM needs a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

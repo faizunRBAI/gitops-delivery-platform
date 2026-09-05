@@ -2,37 +2,51 @@
 
 dev: Developer { shape: person; udap-type: generic.user }
 user: End User { shape: person; udap-type: generic.user }
-admin: Operator (118.179.34.201/32) { shape: person; udap-type: generic.user }
+admin: Operator (public - password only) { shape: person; udap-type: generic.user }
 dns: cPanel DNS royalbengal.xyz (manual CNAMEs) { udap-type: generic.cdn }
 acm: ACM Cert argocd.rbai.royalbengal.xyz (DNS validation) { udap-type: aws.acm }
 repo: GitHub Repo (app + chart + gitops + infra) { shape: cylinder; udap-type: generic.app }
 ci: GitHub Actions (test - security - image - provision - configure - verify) { udap-type: generic.app }
+rollbackwf: Rollback Workflow (manual dispatch - ROLLBACK_IMAGE_TAG repo var) { udap-type: generic.app }
 ecr: ECR Repository { udap-type: aws.ecr }
 vpc: VPC 10.0.0.0/16 (public + private subnets) {
   alb: App ALB (public subnets) { udap-type: aws.alb }
-  argoalb: Argo CD ALB - HTTPS 443 - SG locked to operator CIDR { udap-type: aws.alb }
+  argoalb: Argo CD ALB - HTTPS 443 - open to 0.0.0.0/0 { udap-type: aws.alb }
   eks: EKS Control Plane gitops-delivery-platfor-eks { udap-type: aws.eks }
   nodes: Managed Node Group t3.medium x2 (private subnets) { udap-type: aws.ec2 }
   argocd: Argo CD (namespace argocd - server.insecure) { udap-type: generic.app }
+  rollouts: Argo Rollouts Controller (namespace argo-rollouts) { udap-type: generic.app }
   albc: AWS Load Balancer Controller (IRSA) { udap-type: generic.app }
-  app: Spring Boot App (Helm chart - Deployment) { udap-type: generic.app }
+  app: app-dev - Deployment (namespace app-dev) { udap-type: generic.app }
+  appbg: app-bluegreen - Rollout active + preview (namespace app-bluegreen) { udap-type: generic.app }
+  appcanary: app-canary - Rollout weighted steps (namespace app-canary) { udap-type: generic.app }
 }
 
 dev -> repo: git push
 repo -> ci: workflow_dispatch (platform trigger)
+dev -> rollbackwf: dispatch after setting the tag variable
+rollbackwf -> ecr: verify tag exists before patching
+rollbackwf -> vpc.argocd: kubectl patch Application image.tag
 ci -> ecr: build and push image tag=commit SHA
 ci -> vpc.eks: terraform apply - cluster and node group
 ci -> acm: request cert - output validation CNAME
 dns -> acm: operator adds validation CNAME
 ci -> vpc.argocd: helm install argocd - apply root-app - apply ingress
+ci -> vpc.rollouts: kubectl apply install manifest (idempotent)
 ci -> vpc.app: kubectl patch Application - image tag parameter
+ci -> vpc.appbg: kubectl patch Application - image tag parameter
+ci -> vpc.appcanary: kubectl patch Application - image tag parameter
 vpc.argocd -> repo: poll gitops/ and chart/ (desired state)
 vpc.argocd -> vpc.app: sync - prune - selfHeal
+vpc.argocd -> vpc.appbg: sync - prune - selfHeal
+vpc.argocd -> vpc.appcanary: sync - prune - selfHeal
+vpc.rollouts -> vpc.appbg: manage blueGreen promotion
+vpc.rollouts -> vpc.appcanary: manage canary weights
 vpc.nodes -> ecr: pull image
 vpc.albc -> vpc.alb: provision from Ingress
 vpc.albc -> vpc.argoalb: provision from Ingress
 admin -> dns: resolve argocd.rbai.royalbengal.xyz
-admin -> vpc.argoalb: HTTPS 443 (inbound-cidrs allowlist)
+admin -> vpc.argoalb: HTTPS 443 (open)
 vpc.argoalb -> vpc.argocd: HTTP 80 to argocd-server
 acm -> vpc.argoalb: TLS certificate
 user -> vpc.alb: HTTP

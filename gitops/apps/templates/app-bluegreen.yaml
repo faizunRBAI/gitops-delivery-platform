@@ -1,0 +1,73 @@
+{{- if not .Values.repoURL }}
+{{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
+{{- end }}
+# ---------------------------------------------------------------------------
+# app-bluegreen — the same application chart, released with an Argo Rollouts
+# blue/green strategy, in its own namespace.
+#
+# Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
+# parameter. Nothing here hardcodes an org/repo pair.
+#
+# blueGreen.enabled is set through `helm.values` rather than `parameters`
+# ON PURPOSE. The configure stage patches spec.source.helm.PARAMETERS to inject
+# image.repository/image.tag, and a merge patch REPLACES that whole list — so
+# anything stored there would be wiped on the next deploy. `values` is a
+# separate field the patch never touches.
+#
+# ingress.enabled=false: this instance is exercised in-cluster. Each enabled
+# Ingress provisions its own billable ALB with a public endpoint.
+#
+# The ignoreDifferences protecting the patched parameters lives on the ROOT
+# Application, not here - see gitops/root-app.yaml.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-bluegreen
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: {{ .Values.chartPath | quote }}
+    helm:
+      releaseName: app-bluegreen
+      valueFiles:
+        - values.yaml
+      values: |
+        blueGreen:
+          enabled: true
+        ingress:
+          enabled: false
+      parameters: []
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-bluegreen
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
+  # The Rollouts controller OWNS the replica count during a release and mutates
+  # the active/preview Service selectors as it promotes. Without these
+  # exemptions Argo CD sees controller-driven changes as drift and selfHeal
+  # fights the promotion mid-flight.
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/selector

@@ -53,6 +53,33 @@ time (in CI / Argo CD diff) rather than in the cluster.
 {{- end -}}
 
 {{/*
+True when any progressive-delivery strategy is on, i.e. when an Argo Rollouts
+Rollout owns the pods instead of a Deployment. Templates that must render for
+EXACTLY ONE of the two worlds branch on this, so the decision lives in one
+place rather than being restated (and eventually mis-stated) per file.
+*/}}
+{{- define "app.rolloutEnabled" -}}
+{{- if or .Values.blueGreen.enabled .Values.canary.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+blueGreen active/preview Service names.
+
+values.yaml holds bare, readable SUFFIXES ("active" / "preview") which are
+expanded here against the release fullname. The blueGreen strategy references
+Services BY NAME and the controller does NOT create them — so these two helpers
+and templates/rollout-services.yaml must agree exactly. Deriving both from one
+helper is what keeps them in agreement.
+*/}}
+{{- define "app.activeServiceName" -}}
+{{- printf "%s-%s" (include "app.fullname" .) .Values.blueGreen.activeService | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "app.previewServiceName" -}}
+{{- printf "%s-%s" (include "app.fullname" .) .Values.blueGreen.previewService | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
 The full image reference. Both halves arrive as Argo CD Helm parameters, so an
 empty value means the configure stage did not patch the Application - fail loudly
 instead of rendering a chart that pulls ":".
