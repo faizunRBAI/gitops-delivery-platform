@@ -60,14 +60,14 @@ so no commit can retrigger anything. The guards would be cargo cult here.
 
 ## Pipeline
 
-`test` and `security` run in parallel → `image` → `provision` → `configure` → `verify`.
+`test` and `security` run in parallel → `provision` → `image` → `configure` → `verify`.
 
 | Stage | Does |
 |---|---|
 | `test` | `mvn verify` — unit + MockMvc tests |
 | `security` | Trivy scan of the tree: vuln + secret + misconfig, HIGH/CRITICAL fail the build |
-| `image` | Builds the jar, builds the image, pushes to ECR tagged with the commit SHA |
-| `provision` | `terraform init -reconfigure` + `apply` over `infra/` |
+| `provision` | `terraform init -reconfigure` + `apply` over `infra/` — creates the VPC, EKS cluster, **and the ECR repository** |
+| `image` | Reads the registry URL from terraform state, builds the jar and image, pushes tagged with the commit SHA |
 | `configure` | Argo CD install, ALB controller, anonymous-read check, root app, image-tag patch |
 | `verify` | Polls `root` and `app-dev` for `Synced` + `Healthy`, then curls the ALB |
 
@@ -76,6 +76,23 @@ so no commit can retrigger anything. The guards would be cargo cult here.
 `terraform output -raw`. Nothing is threaded between jobs: GitHub silently drops
 job outputs containing a secret substring, and `PROJECT_NAME` is a secret that
 appears inside every resource name here.
+
+### Why provision runs before image
+
+Earlier revisions built the image first, which meant the `image` stage had to
+create the ECR repository itself with `aws ecr create-repository` — it needed
+somewhere to push before any Terraform had run. That gave one AWS resource **two
+owners**. The CLI always won the race, so `aws_ecr_repository.app` then failed
+its own creation with `RepositoryAlreadyExistsException` on every single run.
+
+Terraform is now the sole owner of the registry, exactly as it is of every other
+AWS resource here, and `image` reads `ecr_repository_url` from state. Ordering
+`provision` first costs nothing — the cluster must exist before `configure` can
+deploy into it regardless.
+
+The `provision` stage carries a one-time **adopt** step that imports a
+pre-existing ECR repository into state if one was left behind by the old
+CLI-created path. On a clean account it is a no-op.
 
 ### What the security stage does and does not cover
 
@@ -97,7 +114,7 @@ the full NVD CVE feed on a cold runner cache, routinely costing 5–15 minutes a
 occasionally rate-limiting without an NVD API key. Trivy covers the same Maven
 dependency tree *and* the container base image — which Dependency-Check never
 inspected — in well under a minute. The `--severity HIGH,CRITICAL --exit-code 1`
-gate is unchanged; the stage still blocks `image`.
+gate is unchanged; the stage still blocks the rest of the pipeline.
 
 The residual gap is Dependency-Check's NVD-specific CPE matching, which
 occasionally flags a Java library Trivy's advisory sources do not. If this stops
