@@ -20,6 +20,6 @@ imageRepository: "241533126054.dkr.ecr.us-east-1.amazonaws.com/gitops-delivery-p
 
 # PER-ENVIRONMENT IMAGE TAGS (commit SHAs). Separate keys so a rollback
 # can move ONE environment back without dragging the others with it.
-imageTagDev: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
-imageTagBluegreen: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
-imageTagCanary: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
+imageTagDev: "7fd35cd1ae0777f63ecb1f46714acae433ed174b"
+imageTagBluegreen: "7fd35cd1ae0777f63ecb1f46714acae433ed174b"
+imageTagCanary: "7fd35cd1ae0777f63ecb1f46714acae433ed174b"
