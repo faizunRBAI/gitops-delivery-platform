@@ -248,8 +248,10 @@ stages:
       - name: Write the new image tag into gitops/apps/values.yaml and commit
         id: writeback
         env:
-          # The built-in token, scoped to this repository. The rendered workflow
-          # grants `contents: write` at job level. No PAT is stored anywhere.
+          # The built-in token, scoped to this repository. The REPOSITORY's
+          # "Workflow permissions" setting must be "Read and write" - the
+          # pipeline spec has no field for a job-level `permissions:` block.
+          # See ADR-003 in .udap/notes.md.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -656,7 +658,27 @@ stages:
       - name: Wait for Argo CD Applications to be Synced and Healthy
         run: |
           set -euo pipefail
+          # ARGO REPORTS A PAUSED ROLLOUT AS health=Suspended, NOT Healthy.
+          #
+          # A blue/green Rollout with autoPromotionEnabled=false rests at
+          # `Paused` on every revision until a human promotes it, and Argo
+          # propagates that to the owning Application as `Suspended`. Demanding
+          # Healthy from app-bluegreen therefore times out on a deploy that
+          # worked perfectly - which is exactly what happened on 2026-09-05.
+          #
+          # `Suspended` is a DISTINCT status from `Degraded`; the Degraded
+          # branch below still fails the job, so a genuinely broken Rollout is
+          # caught. The Rollout-level step that follows re-checks these two
+          # applications against the controller's own phase.
+          #
+          # SCOPED DELIBERATELY: root and app-dev own no Rollout and can never
+          # legitimately be Suspended, so they stay strictly Healthy and a real
+          # hang there is still caught.
           for APP in root app-dev app-bluegreen app-canary; do
+            case "$APP" in
+              app-bluegreen|app-canary) ROLLOUT_BACKED=true ;;
+              *)                        ROLLOUT_BACKED=false ;;
+            esac
             echo "waiting for Application/$APP"
             DEADLINE=$((SECONDS + 600))
             while true; do
@@ -664,6 +686,12 @@ stages:
               HEALTH="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)"
               echo "  $APP sync=$SYNC health=$HEALTH"
               if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                break
+              fi
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Suspended" ] \
+                 && [ "$ROLLOUT_BACKED" = "true" ]; then
+                echo "  OK: $APP is Suspended - a Rollout is paused awaiting"
+                echo "      promotion. The rollout check below confirms it."
                 break
               fi
               if [ "$HEALTH" = "Degraded" ]; then
@@ -692,6 +720,11 @@ stages:
           # promotion. Treat Healthy and Paused as acceptable resting states and
           # fail only on Degraded - otherwise every first deploy of the
           # blue/green instance would "fail" while behaving exactly as designed.
+          #
+          # This is the AUTHORITATIVE check for the two Rollout-backed
+          # namespaces: it reads the controller's own phase rather than Argo's
+          # aggregated health, so a Rollout that is stuck for a real reason
+          # (bad image, missing Service) still fails the deploy here.
           for NS in app-bluegreen app-canary; do
             echo "--- namespace $NS"
             DEADLINE=$((SECONDS + 600))
@@ -988,6 +1021,15 @@ pipelines:
               kubectl -n argocd patch application root --type merge \
                 --patch "{\"spec\":{\"source\":{\"targetRevision\":\"${ROLLBACK_SHA}\"}}}"
               echo "root repointed to ${ROLLBACK_SHA}"
+              # A ROLLBACK OF A ROLLOUT-BACKED ENVIRONMENT RESTS AT Suspended.
+              # Same reason as the verify stage: a paused blue/green Rollout is
+              # reported by Argo as health=Suspended, not Healthy. Accept it for
+              # the two Rollout-backed applications and let the promotion note
+              # below tell the operator what to do next.
+              case "$APP" in
+                app-bluegreen|app-canary) ROLLOUT_BACKED=true ;;
+                *)                        ROLLOUT_BACKED=false ;;
+              esac
               DEADLINE=$((SECONDS + 600))
               while true; do
                 TAG="$(kubectl get application "$APP" -n argocd \
@@ -997,6 +1039,12 @@ pipelines:
                 echo "  tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH"
                 if [ "$TAG" = "$ROLLBACK_TAG" ] && [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
                   echo "rollback complete: ${APP} is Synced and Healthy on ${ROLLBACK_TAG}"
+                  break
+                fi
+                if [ "$TAG" = "$ROLLBACK_TAG" ] && [ "$SYNC" = "Synced" ] \
+                   && [ "$HEALTH" = "Suspended" ] && [ "$ROLLOUT_BACKED" = "true" ]; then
+                  echo "rollback applied: ${APP} is on ${ROLLBACK_TAG} and paused"
+                  echo "awaiting promotion - see the note below."
                   break
                 fi
                 if [ "$HEALTH" = "Degraded" ]; then

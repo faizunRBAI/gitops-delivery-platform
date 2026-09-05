@@ -111,21 +111,30 @@ jobs:
         \ eks update-kubeconfig --region \"$AWS_REGION\" \\\n  --name \"$(cat /tmp/cluster_name)\"\
         \nkubectl -n argocd patch application root --type merge \\\n  --patch \"{\\\
         \"spec\\\":{\\\"source\\\":{\\\"targetRevision\\\":\\\"${ROLLBACK_SHA}\\\"\
-        }}}\"\necho \"root repointed to ${ROLLBACK_SHA}\"\nDEADLINE=$((SECONDS + 600))\n\
-        while true; do\n  TAG=\"$(kubectl get application \"$APP\" -n argocd \\\n\
-        \    -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\")].value}'\
-        \ 2>/dev/null || true)\"\n  SYNC=\"$(kubectl get application \"$APP\" -n argocd\
-        \ -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)\"\n  HEALTH=\"\
-        $(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.health.status}'\
+        }}}\"\necho \"root repointed to ${ROLLBACK_SHA}\"\n# A ROLLBACK OF A ROLLOUT-BACKED\
+        \ ENVIRONMENT RESTS AT Suspended.\n# Same reason as the verify stage: a paused\
+        \ blue/green Rollout is\n# reported by Argo as health=Suspended, not Healthy.\
+        \ Accept it for\n# the two Rollout-backed applications and let the promotion\
+        \ note\n# below tell the operator what to do next.\ncase \"$APP\" in\n  app-bluegreen|app-canary)\
+        \ ROLLOUT_BACKED=true ;;\n  *)                        ROLLOUT_BACKED=false\
+        \ ;;\nesac\nDEADLINE=$((SECONDS + 600))\nwhile true; do\n  TAG=\"$(kubectl\
+        \ get application \"$APP\" -n argocd \\\n    -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"\
+        image.tag\")].value}' 2>/dev/null || true)\"\n  SYNC=\"$(kubectl get application\
+        \ \"$APP\" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo\
+        \ Unknown)\"\n  HEALTH=\"$(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.health.status}'\
         \ 2>/dev/null || echo Unknown)\"\n  echo \"  tag=${TAG:-<empty>} sync=$SYNC\
         \ health=$HEALTH\"\n  if [ \"$TAG\" = \"$ROLLBACK_TAG\" ] && [ \"$SYNC\" =\
         \ \"Synced\" ] && [ \"$HEALTH\" = \"Healthy\" ]; then\n    echo \"rollback\
         \ complete: ${APP} is Synced and Healthy on ${ROLLBACK_TAG}\"\n    break\n\
-        \  fi\n  if [ \"$HEALTH\" = \"Degraded\" ]; then\n    echo \"ERROR: ${APP}\
-        \ is Degraded after the rollback.\"\n    kubectl describe application \"$APP\"\
-        \ -n argocd\n    exit 1\n  fi\n  if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n\
-        \    echo \"timed out (tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH)\"\n\
-        \    kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n\
+        \  fi\n  if [ \"$TAG\" = \"$ROLLBACK_TAG\" ] && [ \"$SYNC\" = \"Synced\" ]\
+        \ \\\n     && [ \"$HEALTH\" = \"Suspended\" ] && [ \"$ROLLOUT_BACKED\" = \"\
+        true\" ]; then\n    echo \"rollback applied: ${APP} is on ${ROLLBACK_TAG}\
+        \ and paused\"\n    echo \"awaiting promotion - see the note below.\"\n  \
+        \  break\n  fi\n  if [ \"$HEALTH\" = \"Degraded\" ]; then\n    echo \"ERROR:\
+        \ ${APP} is Degraded after the rollback.\"\n    kubectl describe application\
+        \ \"$APP\" -n argocd\n    exit 1\n  fi\n  if [ \"$SECONDS\" -ge \"$DEADLINE\"\
+        \ ]; then\n    echo \"timed out (tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH)\"\
+        \n    kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n\
         \    exit 1\n  fi\n  sleep 15\ndone\necho\necho \"NOTE for app-bluegreen:\
         \ a rollback creates a new PREVIEW\"\necho \"ReplicaSet on the old tag and\
         \ waits for promotion, because\"\necho \"autoPromotionEnabled is false. Promote\

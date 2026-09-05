@@ -454,42 +454,62 @@ jobs:
     - name: Update kubeconfig
       run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
     - name: Wait for Argo CD Applications to be Synced and Healthy
-      run: "set -euo pipefail\nfor APP in root app-dev app-bluegreen app-canary; do\n\
-        \  echo \"waiting for Application/$APP\"\n  DEADLINE=$((SECONDS + 600))\n\
-        \  while true; do\n    SYNC=\"$(kubectl get application \"$APP\" -n argocd\
-        \ -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)\"\n   \
-        \ HEALTH=\"$(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.health.status}'\
-        \ 2>/dev/null || echo Unknown)\"\n    echo \"  $APP sync=$SYNC health=$HEALTH\"\
-        \n    if [ \"$SYNC\" = \"Synced\" ] && [ \"$HEALTH\" = \"Healthy\" ]; then\n\
-        \      break\n    fi\n    if [ \"$HEALTH\" = \"Degraded\" ]; then\n      echo\
-        \ \"Application $APP is Degraded\"\n      kubectl describe application \"\
-        $APP\" -n argocd\n      exit 1\n    fi\n    if [ \"$SECONDS\" -ge \"$DEADLINE\"\
-        \ ]; then\n      echo \"timed out waiting for $APP (sync=$SYNC health=$HEALTH)\"\
-        \n      # sync=Unknown means Argo could not RENDER the source. The\n     \
-        \ # ComparisonError condition carries the helm template error and\n      #\
-        \ is far more useful than the describe output alone.\n      kubectl get application\
-        \ \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n      echo\n    \
-        \  kubectl describe application \"$APP\" -n argocd\n      exit 1\n    fi\n\
-        \    sleep 15\n  done\ndone\n"
+      run: "set -euo pipefail\n# ARGO REPORTS A PAUSED ROLLOUT AS health=Suspended,\
+        \ NOT Healthy.\n#\n# A blue/green Rollout with autoPromotionEnabled=false\
+        \ rests at\n# `Paused` on every revision until a human promotes it, and Argo\n\
+        # propagates that to the owning Application as `Suspended`. Demanding\n# Healthy\
+        \ from app-bluegreen therefore times out on a deploy that\n# worked perfectly\
+        \ - which is exactly what happened on 2026-09-05.\n#\n# `Suspended` is a DISTINCT\
+        \ status from `Degraded`; the Degraded\n# branch below still fails the job,\
+        \ so a genuinely broken Rollout is\n# caught. The Rollout-level step that\
+        \ follows re-checks these two\n# applications against the controller's own\
+        \ phase.\n#\n# SCOPED DELIBERATELY: root and app-dev own no Rollout and can\
+        \ never\n# legitimately be Suspended, so they stay strictly Healthy and a\
+        \ real\n# hang there is still caught.\nfor APP in root app-dev app-bluegreen\
+        \ app-canary; do\n  case \"$APP\" in\n    app-bluegreen|app-canary) ROLLOUT_BACKED=true\
+        \ ;;\n    *)                        ROLLOUT_BACKED=false ;;\n  esac\n  echo\
+        \ \"waiting for Application/$APP\"\n  DEADLINE=$((SECONDS + 600))\n  while\
+        \ true; do\n    SYNC=\"$(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.sync.status}'\
+        \ 2>/dev/null || echo Unknown)\"\n    HEALTH=\"$(kubectl get application \"\
+        $APP\" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo\
+        \ Unknown)\"\n    echo \"  $APP sync=$SYNC health=$HEALTH\"\n    if [ \"$SYNC\"\
+        \ = \"Synced\" ] && [ \"$HEALTH\" = \"Healthy\" ]; then\n      break\n   \
+        \ fi\n    if [ \"$SYNC\" = \"Synced\" ] && [ \"$HEALTH\" = \"Suspended\" ]\
+        \ \\\n       && [ \"$ROLLOUT_BACKED\" = \"true\" ]; then\n      echo \"  OK:\
+        \ $APP is Suspended - a Rollout is paused awaiting\"\n      echo \"      promotion.\
+        \ The rollout check below confirms it.\"\n      break\n    fi\n    if [ \"\
+        $HEALTH\" = \"Degraded\" ]; then\n      echo \"Application $APP is Degraded\"\
+        \n      kubectl describe application \"$APP\" -n argocd\n      exit 1\n  \
+        \  fi\n    if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo \"timed\
+        \ out waiting for $APP (sync=$SYNC health=$HEALTH)\"\n      # sync=Unknown\
+        \ means Argo could not RENDER the source. The\n      # ComparisonError condition\
+        \ carries the helm template error and\n      # is far more useful than the\
+        \ describe output alone.\n      kubectl get application \"$APP\" -n argocd\
+        \ -o jsonpath='{.status.conditions}'\n      echo\n      kubectl describe application\
+        \ \"$APP\" -n argocd\n      exit 1\n    fi\n    sleep 15\n  done\ndone\n"
     - name: Confirm the Rollout workloads reached a stable state
       run: "set -euo pipefail\n# A blue/green Rollout with autoPromotionEnabled=false\
         \ PAUSES at\n# `Paused` on its FIRST revision by design, waiting for a human\n\
         # promotion. Treat Healthy and Paused as acceptable resting states and\n#\
         \ fail only on Degraded - otherwise every first deploy of the\n# blue/green\
-        \ instance would \"fail\" while behaving exactly as designed.\nfor NS in app-bluegreen\
-        \ app-canary; do\n  echo \"--- namespace $NS\"\n  DEADLINE=$((SECONDS + 600))\n\
-        \  while true; do\n    PHASE=\"$(kubectl get rollout -n \"$NS\" \\\n     \
-        \ -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)\"\n    echo\
-        \ \"  rollout phase=${PHASE:-<none>}\"\n    case \"$PHASE\" in\n      Healthy|Paused)\n\
-        \        echo \"  OK ($PHASE)\"\n        break\n        ;;\n      Degraded)\n\
-        \        echo \"rollout in $NS is Degraded\"\n        kubectl describe rollout\
-        \ -n \"$NS\"\n        kubectl get pods -n \"$NS\"\n        exit 1\n      \
-        \  ;;\n    esac\n    if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo\
-        \ \"timed out waiting for the rollout in $NS (phase=${PHASE:-<none>})\"\n\
-        \      kubectl describe rollout -n \"$NS\"\n      kubectl get pods -n \"$NS\"\
-        \n      exit 1\n    fi\n    sleep 15\n  done\ndone\necho\necho \"Blue/green\
-        \ promotion is MANUAL by design. To promote:\"\necho \"  kubectl argo rollouts\
-        \ promote <rollout> -n app-bluegreen\"\n"
+        \ instance would \"fail\" while behaving exactly as designed.\n#\n# This is\
+        \ the AUTHORITATIVE check for the two Rollout-backed\n# namespaces: it reads\
+        \ the controller's own phase rather than Argo's\n# aggregated health, so a\
+        \ Rollout that is stuck for a real reason\n# (bad image, missing Service)\
+        \ still fails the deploy here.\nfor NS in app-bluegreen app-canary; do\n \
+        \ echo \"--- namespace $NS\"\n  DEADLINE=$((SECONDS + 600))\n  while true;\
+        \ do\n    PHASE=\"$(kubectl get rollout -n \"$NS\" \\\n      -o jsonpath='{.items[0].status.phase}'\
+        \ 2>/dev/null || true)\"\n    echo \"  rollout phase=${PHASE:-<none>}\"\n\
+        \    case \"$PHASE\" in\n      Healthy|Paused)\n        echo \"  OK ($PHASE)\"\
+        \n        break\n        ;;\n      Degraded)\n        echo \"rollout in $NS\
+        \ is Degraded\"\n        kubectl describe rollout -n \"$NS\"\n        kubectl\
+        \ get pods -n \"$NS\"\n        exit 1\n        ;;\n    esac\n    if [ \"$SECONDS\"\
+        \ -ge \"$DEADLINE\" ]; then\n      echo \"timed out waiting for the rollout\
+        \ in $NS (phase=${PHASE:-<none>})\"\n      kubectl describe rollout -n \"\
+        $NS\"\n      kubectl get pods -n \"$NS\"\n      exit 1\n    fi\n    sleep\
+        \ 15\n  done\ndone\necho\necho \"Blue/green promotion is MANUAL by design.\
+        \ To promote:\"\necho \"  kubectl argo rollouts promote <rollout> -n app-bluegreen\"\
+        \n"
     - name: Resolve ingress endpoint and curl the service
       run: "set -euo pipefail\nDEADLINE=$((SECONDS + 600))\nwhile true; do\n  HOST=\"\
         $(kubectl get ingress -n app-dev -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}'\
