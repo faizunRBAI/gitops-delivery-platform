@@ -223,6 +223,27 @@ jobs:
         helm\\\":{\\\"parameters\\\":[{\\\"name\\\":\\\"image.repository\\\",\\\"\
         value\\\":\\\"${ECR_URL}\\\"},{\\\"name\\\":\\\"image.tag\\\",\\\"value\\\"\
         :\\\"${GITHUB_SHA}\\\"}]}}}}\"\n"
+    - name: Confirm the image parameters survived root's reconciliation
+      run: "set -euo pipefail\n# The patch above writes CLUSTER state onto an object\
+        \ that the ROOT\n# Application manages from Git, where it is rendered with\
+        \ an empty\n# `parameters: []`. root therefore has ignoreDifferences on\n\
+        # /spec/source/helm/parameters - without it, selfHeal reverts this\n# patch\
+        \ within seconds and app-dev sits at sync=Unknown forever with\n# \"image.repository\
+        \ is empty\" (that is exactly how the previous deploy\n# failed).\n#\n# ignoreDifferences\
+        \ is easy to attach to the wrong Application and\n# fails SILENTLY when it\
+        \ is, so assert the outcome here rather than\n# trusting the patch. Watch\
+        \ across several reconcile loops: a revert\n# is not instantaneous.\nDEADLINE=$((SECONDS\
+        \ + 180))\nwhile true; do\n  TAG=\"$(kubectl get application app-dev -n argocd\
+        \ \\\n    -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\"\
+        )].value}' 2>/dev/null || true)\"\n  if [ \"$TAG\" != \"$GITHUB_SHA\" ]; then\n\
+        \    echo \"ERROR: image.tag on app-dev is '${TAG:-<empty>}', expected the\
+        \ commit SHA.\"\n    echo \"The root Application reverted the patch, which\
+        \ means its\"\n    echo \"ignoreDifferences for /spec/source/helm/parameters\
+        \ is missing\"\n    echo \"or attached to the wrong Application.\"\n    kubectl\
+        \ get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'\n\
+        \    exit 1\n  fi\n  if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n    echo\
+        \ \"OK: image parameters stable on app-dev for 180s\"\n    break\n  fi\n \
+        \ sleep 15\ndone\n"
   verify:
     runs-on: ubuntu-latest
     needs:
@@ -264,9 +285,12 @@ jobs:
         \ \"$HEALTH\" = \"Degraded\" ]; then\n      echo \"Application $APP is Degraded\"\
         \n      kubectl describe application \"$APP\" -n argocd\n      exit 1\n  \
         \  fi\n    if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo \"timed\
-        \ out waiting for $APP (sync=$SYNC health=$HEALTH)\"\n      kubectl describe\
-        \ application \"$APP\" -n argocd\n      exit 1\n    fi\n    sleep 15\n  done\n\
-        done\n"
+        \ out waiting for $APP (sync=$SYNC health=$HEALTH)\"\n      # sync=Unknown\
+        \ means Argo could not RENDER the source. The\n      # ComparisonError condition\
+        \ carries the helm template error and\n      # is far more useful than the\
+        \ describe output alone.\n      kubectl get application \"$APP\" -n argocd\
+        \ -o jsonpath='{.status.conditions}'\n      echo\n      kubectl describe application\
+        \ \"$APP\" -n argocd\n      exit 1\n    fi\n    sleep 15\n  done\ndone\n"
     - name: Resolve ingress endpoint and curl the service
       run: "set -euo pipefail\nDEADLINE=$((SECONDS + 600))\nwhile true; do\n  HOST=\"\
         $(kubectl get ingress -n app-dev -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}'\

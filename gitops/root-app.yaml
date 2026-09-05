@@ -40,3 +40,24 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+  # THIS BELONGS HERE, ON THE ROOT — not on the child.
+  #
+  # The configure stage patches image.repository and image.tag onto the CHILD
+  # Application (app-dev) with `kubectl patch`, which makes the running version
+  # cluster state rather than Git state. But the object that MANAGES app-dev is
+  # THIS root Application: root renders app-dev from gitops/apps/ with an empty
+  # `parameters: []` and, with selfHeal on, reverts anything that differs.
+  #
+  # An ignoreDifferences declared on app-dev itself is powerless here — it
+  # governs how app-dev compares ITS OWN managed resources (the Deployment,
+  # Service and Ingress), not how root compares app-dev. The child cannot
+  # exempt itself from its parent's reconciliation.
+  #
+  # Without this block the sequence is: configure patches the parameters, root
+  # self-heals them back to [], the chart's image.repository guard fires, and
+  # app-dev sits at sync=Unknown with a ComparisonError forever.
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Application
+      jsonPointers:
+        - /spec/source/helm/parameters

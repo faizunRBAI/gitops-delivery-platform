@@ -283,6 +283,39 @@ stages:
           done
           kubectl patch application app-dev --namespace argocd --type merge \
             --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${GITHUB_SHA}\"}]}}}}"
+      - name: Confirm the image parameters survived root's reconciliation
+        run: |
+          set -euo pipefail
+          # The patch above writes CLUSTER state onto an object that the ROOT
+          # Application manages from Git, where it is rendered with an empty
+          # `parameters: []`. root therefore has ignoreDifferences on
+          # /spec/source/helm/parameters - without it, selfHeal reverts this
+          # patch within seconds and app-dev sits at sync=Unknown forever with
+          # "image.repository is empty" (that is exactly how the previous deploy
+          # failed).
+          #
+          # ignoreDifferences is easy to attach to the wrong Application and
+          # fails SILENTLY when it is, so assert the outcome here rather than
+          # trusting the patch. Watch across several reconcile loops: a revert
+          # is not instantaneous.
+          DEADLINE=$((SECONDS + 180))
+          while true; do
+            TAG="$(kubectl get application app-dev -n argocd \
+              -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+            if [ "$TAG" != "$GITHUB_SHA" ]; then
+              echo "ERROR: image.tag on app-dev is '${TAG:-<empty>}', expected the commit SHA."
+              echo "The root Application reverted the patch, which means its"
+              echo "ignoreDifferences for /spec/source/helm/parameters is missing"
+              echo "or attached to the wrong Application."
+              kubectl get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "OK: image parameters stable on app-dev for 180s"
+              break
+            fi
+            sleep 15
+          done
 
   - id: verify
     kind: verify
@@ -334,6 +367,11 @@ stages:
               fi
               if [ "$SECONDS" -ge "$DEADLINE" ]; then
                 echo "timed out waiting for $APP (sync=$SYNC health=$HEALTH)"
+                # sync=Unknown means Argo could not RENDER the source. The
+                # ComparisonError condition carries the helm template error and
+                # is far more useful than the describe output alone.
+                kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
+                echo
                 kubectl describe application "$APP" -n argocd
                 exit 1
               fi

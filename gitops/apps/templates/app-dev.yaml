@@ -12,9 +12,12 @@
 # the running version CLUSTER state rather than Git state. That is why a deploy
 # never produces a commit, and why selfHeal can stay on permanently.
 #
-# ignoreDifferences stops Argo CD from seeing its own patched image parameters
-# as drift against Git and reverting them on the next reconcile — without it,
-# selfHeal and the configure stage would fight over every deploy.
+# The ignoreDifferences that protects those patched parameters lives on the
+# ROOT Application (gitops/root-app.yaml), NOT here. Root is what renders and
+# reconciles this object, so root is what must be told to ignore the drift it
+# would otherwise see. A copy on this Application governs only how app-dev
+# compares its OWN managed resources (Deployment/Service/Ingress) and cannot
+# exempt app-dev from its parent — it silently did nothing and cost a deploy.
 # ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -49,8 +52,3 @@ spec:
         duration: 15s
         factor: 2
         maxDuration: 3m
-  ignoreDifferences:
-    - group: argoproj.io
-      kind: Application
-      jsonPointers:
-        - /spec/source/helm/parameters
