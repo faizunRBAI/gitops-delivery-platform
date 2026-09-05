@@ -26,14 +26,35 @@ variable "cluster_public_access_cidrs" {
 # AVD-AWS-0040/0041). This one governs the Argo CD web UI, which authenticates
 # with a PASSWORD — a single factor in front of cluster-admin authority. It has
 # no default on purpose.
+#
+# ACCEPTED RISK (operator decision, 2026-09-05): this variable previously
+# carried a validation block refusing 0.0.0.0/0. The operator was presented
+# with the exposure and the two safer alternatives (a second allowlisted CIDR,
+# or SSO/OIDC with admin.enabled=false) and explicitly chose to open the UI to
+# the internet. The refusal was removed on that instruction. The reasoning it
+# encoded is preserved in the description below rather than deleted, and the
+# length>0 validation is retained so a MISSING value still fails loudly instead
+# of silently producing an open or broken endpoint.
 variable "argocd_allowed_cidrs" {
-  description = "Source CIDRs permitted to reach the Argo CD UI load balancer. Written into the ALB security group via the ingress inbound-cidrs annotation. Supplied as TF_VAR_argocd_allowed_cidrs from the ARGOCD_ALLOWED_CIDRS pipeline secret so the operator's home IP is not published in this public repository. INTENTIONALLY HAS NO DEFAULT: a missing value must fail the apply loudly rather than quietly defaulting to an open endpoint. Do not add a default, and do not set this to 0.0.0.0/0 — the Argo CD UI can change what runs in the cluster and read every Secret Argo manages. If access is needed from unpredictable networks, the correct change is SSO/OIDC with admin.enabled=false, not a wider CIDR."
-  type        = list(string)
+  description = <<-EOT
+    Source CIDRs permitted to reach the Argo CD UI load balancer. Written into
+    the ALB security group via the ingress inbound-cidrs annotation. Supplied as
+    TF_VAR_argocd_allowed_cidrs from the ARGOCD_ALLOWED_CIDRS pipeline secret so
+    the operator's source ranges are not published in this public repository.
 
-  validation {
-    condition     = !contains(var.argocd_allowed_cidrs, "0.0.0.0/0")
-    error_message = "argocd_allowed_cidrs must not contain 0.0.0.0/0. The Argo CD UI holds cluster-admin authority behind a single password; exposing it to the internet is not a supported configuration. Use a specific CIDR, or switch to SSO/OIDC with admin.enabled=false."
-  }
+    INTENTIONALLY HAS NO DEFAULT: a missing value must fail the apply loudly
+    rather than quietly defaulting to an open endpoint. Do not add a default.
+
+    SECURITY NOTE — 0.0.0.0/0 is ACCEPTED HERE BY EXPLICIT OPERATOR DECISION
+    (2026-09-05), not because it is safe. The Argo CD UI can change what runs in
+    the cluster and read every Secret Argo manages, and it is guarded by a single
+    shared admin password. When set to 0.0.0.0/0 that password is the ONLY
+    barrier between the public internet and cluster-admin authority. The correct
+    fix for access from unpredictable networks is SSO/OIDC with
+    admin.enabled=false, which makes this CIDR largely irrelevant; widening the
+    CIDR is the weaker substitute. Re-narrow this value once SSO is in place.
+  EOT
+  type        = list(string)
 
   validation {
     condition     = length(var.argocd_allowed_cidrs) > 0
