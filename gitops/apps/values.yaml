@@ -1,0 +1,8 @@
+# repoURL is supplied by the ROOT Application as a Helm parameter
+# (spec.source.helm.parameters[0], set once at bootstrap by the configure stage
+# from $GITOPS_REPO_URL). Keeping it out of Git means these manifests carry no
+# hardcoded org/repo pair and work unchanged in a fork.
+repoURL: ""
+
+targetRevision: main
+chartPath: chart/gitops-delivery-platform

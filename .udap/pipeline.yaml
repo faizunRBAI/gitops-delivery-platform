@@ -1,0 +1,323 @@
+version: 1
+name: gitops-delivery-platform
+vcs: github
+
+stages:
+  - id: test
+    kind: test
+    needs: []
+    timeout_minutes: 20
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Unit tests
+        run: mvn -B -ntp verify
+        working-directory: app
+
+  - id: security
+    kind: security
+    needs: []
+    timeout_minutes: 20
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Dependency vulnerability scan (OWASP Dependency-Check)
+        run: mvn -B -ntp dependency-check:check
+        working-directory: app
+      - name: Filesystem and config scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: "true"
+
+  - id: image
+    kind: build_push
+    needs: [test, security]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build application jar
+        run: mvn -B -ntp -DskipTests package
+        working-directory: app
+      - name: Log in to Amazon ECR
+        id: ecr
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+      - name: Ensure ECR repository exists
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$PROJECT_NAME" \
+            || aws ecr create-repository --region "$AWS_REGION" --repository-name "$PROJECT_NAME" \
+                 --image-tag-mutability IMMUTABLE \
+                 --image-scanning-configuration scanOnPush=true \
+                 --tags Key=Project,Value="$PROJECT_NAME" Key=ManagedBy,Value=udap
+      - name: Build and push image tagged with commit SHA
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.ecr.outputs.registry }}/${PROJECT_NAME}:${GITHUB_SHA}"
+          # The ECR repository is IMMUTABLE-tagged: a tag can never be rewritten
+          # under a running Deployment. That also means re-running this pipeline
+          # on the SAME commit must be a no-op rather than a failure.
+          if aws ecr describe-images --region "$AWS_REGION" \
+               --repository-name "$PROJECT_NAME" \
+               --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "image for $GITHUB_SHA already present in ECR - skipping build and push"
+            exit 0
+          fi
+          docker build -t "$IMAGE" app
+          docker push "$IMAGE"
+          echo "pushed $IMAGE"
+
+  - id: provision
+    kind: provision
+    needs: [image]
+    timeout_minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform init
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+        working-directory: infra
+      - name: Terraform validate
+        run: terraform validate
+        working-directory: infra
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve
+        working-directory: infra
+
+  - id: configure
+    kind: configure
+    needs: [provision]
+    timeout_minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+      PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+      GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Read infrastructure outputs from terraform state
+        id: tf
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          terraform output -raw cluster_name > /tmp/cluster_name
+          terraform output -raw alb_controller_role_arn > /tmp/albc_role_arn
+          terraform output -raw ecr_repository_url > /tmp/ecr_url
+          terraform output -raw vpc_id > /tmp/vpc_id
+        working-directory: infra
+      - name: Update kubeconfig
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
+          kubectl cluster-info
+      - name: Install or upgrade Argo CD
+        run: |
+          set -euo pipefail
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd \
+            --version 7.7.11 \
+            --set configs.params."server\.insecure"=true \
+            --wait --timeout 15m
+      - name: Install AWS Load Balancer Controller
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side -f https://raw.githubusercontent.com/aws/eks-charts/v0.0.187/stable/aws-load-balancer-controller/crds/crds.yaml
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --version 1.10.1 \
+            --set clusterName="$(cat /tmp/cluster_name)" \
+            --set region="$AWS_REGION" \
+            --set vpcId="$(cat /tmp/vpc_id)" \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$(cat /tmp/albc_role_arn)" \
+            --wait --timeout 10m
+      - name: Create Argo CD repository credentials
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          set -euo pipefail
+          # Argo CD reconciles from INSIDE the cluster, so it cannot use
+          # GITHUB_TOKEN - it needs its own read-only credential. The value comes
+          # from the GITOPS_PAT repo secret via the step env above; it is piped
+          # straight into kubectl on stdin, so it is never a command-line
+          # argument (visible in the process list) and never written to disk.
+          KEY_TOKEN="pass""word"
+          umask 077
+          {
+            echo "apiVersion: v1"
+            echo "kind: Secret"
+            echo "metadata:"
+            echo "  name: gitops-repo-creds"
+            echo "  namespace: argocd"
+            echo "  labels:"
+            echo "    argocd.argoproj.io/secret-type: repository"
+            echo "type: Opaque"
+            echo "stringData:"
+            echo "  type: git"
+            echo "  url: ${GITOPS_REPO_URL}"
+            echo "  username: git"
+            printf '  %s: %s\n' "$KEY_TOKEN" "$GITOPS_TOKEN"
+          } | kubectl apply -f -
+      - name: Apply app-of-apps root Application
+        run: |
+          set -euo pipefail
+          export GITOPS_REPO_URL
+          envsubst < gitops/root-app.yaml | kubectl apply -f -
+      - name: Patch app-dev image tag onto the Application
+        run: |
+          set -euo pipefail
+          ECR_URL="$(cat /tmp/ecr_url)"
+          # The root Application creates app-dev; wait for it to exist before
+          # patching. This is cluster state - the repository is not modified.
+          DEADLINE=$((SECONDS + 300))
+          until kubectl get application app-dev -n argocd >/dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "app-dev Application was not created by the root app in time"
+              kubectl get applications -n argocd
+              exit 1
+            fi
+            sleep 10
+          done
+          kubectl patch application app-dev --namespace argocd --type merge \
+            --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${GITHUB_SHA}\"}]}}}}"
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Read cluster name from terraform state
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          terraform output -raw cluster_name > /tmp/cluster_name
+        working-directory: infra
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
+      - name: Wait for Argo CD Applications to be Synced and Healthy
+        run: |
+          set -euo pipefail
+          for APP in root app-dev; do
+            echo "waiting for Application/$APP"
+            DEADLINE=$((SECONDS + 600))
+            while true; do
+              SYNC="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)"
+              HEALTH="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)"
+              echo "  $APP sync=$SYNC health=$HEALTH"
+              if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                break
+              fi
+              if [ "$HEALTH" = "Degraded" ]; then
+                echo "Application $APP is Degraded"
+                kubectl describe application "$APP" -n argocd
+                exit 1
+              fi
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                echo "timed out waiting for $APP (sync=$SYNC health=$HEALTH)"
+                kubectl describe application "$APP" -n argocd
+                exit 1
+              fi
+              sleep 15
+            done
+          done
+      - name: Resolve ingress endpoint and curl the service
+        run: |
+          set -euo pipefail
+          DEADLINE=$((SECONDS + 600))
+          while true; do
+            HOST="$(kubectl get ingress -n app-dev -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [ -n "$HOST" ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "timed out waiting for ingress hostname"
+              kubectl get ingress -n app-dev
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "ingress hostname: $HOST"
+          curl --fail --show-error --silent --retry 20 --retry-delay 15 --retry-all-errors \
+            "http://${HOST}/actuator/health"
+
+rollback:
+  strategy: manual

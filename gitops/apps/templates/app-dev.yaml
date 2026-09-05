@@ -1,0 +1,56 @@
+{{- if not .Values.repoURL }}
+{{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
+{{- end }}
+# ---------------------------------------------------------------------------
+# app-dev — the dev instance of the application chart.
+#
+# Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
+# parameter. Nothing here hardcodes an org/repo pair.
+#
+# NOTE the empty helm.parameters list. The configure stage patches
+# image.repository and image.tag onto THIS OBJECT with `kubectl patch`, making
+# the running version CLUSTER state rather than Git state. That is why a deploy
+# never produces a commit, and why selfHeal can stay on permanently.
+#
+# ignoreDifferences stops Argo CD from seeing its own patched image parameters
+# as drift against Git and reverting them on the next reconcile — without it,
+# selfHeal and the configure stage would fight over every deploy.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: {{ .Values.chartPath | quote }}
+    helm:
+      releaseName: app-dev
+      valueFiles:
+        - values.yaml
+      parameters: []
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Application
+      jsonPointers:
+        - /spec/source/helm/parameters

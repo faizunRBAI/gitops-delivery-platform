@@ -1,0 +1,29 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: gitops-delivery-platform
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+app:
+  name: ${APP_NAME:gitops-delivery-platform}
+  imageTag: ${IMAGE_TAG:dev}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true

@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------------------
+# Phase 1 renders a plain Deployment. The full values surface is written NOW so
+# Phase 2 (blue/green) and Phase 3 (canary) are a flag flip, not a chart rewrite.
+#
+# blueGreen.enabled and canary.enabled are MUTUALLY EXCLUSIVE. The Deployment
+# template renders only when BOTH are false; templates/NOTES and the helper
+# `validate-strategy` fail the render if both are switched on at once.
+# ---------------------------------------------------------------------------
+
+replicaCount: 2
+
+image:
+  # repository is patched onto the Argo CD Application by the configure stage
+  # (the ECR URL comes from `terraform output -raw ecr_repository_url`).
+  repository: ""
+  # NEVER commit a real tag here. Argo CD receives it as a Helm parameter, so a
+  # deploy leaves this repository untouched and selfHeal has nothing to fight.
+  tag: ""
+  pullPolicy: Always
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+  # No host: traffic is served on the ALB's own DNS name in Phase 1.
+  # A real domain + ACM certificate is a listed optional enhancement.
+  host: ""
+  path: /
+  pathType: Prefix
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    # Memory limit only. A CPU limit throttles the JVM during startup and makes
+    # readiness flap on a t3.medium.
+    memory: 768Mi
+
+probes:
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 6
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 45
+    periodSeconds: 20
+    failureThreshold: 3
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+env:
+  APP_NAME: gitops-delivery-platform
+
+# ---------------------------------------------------------------------------
+# PHASE 2 — Argo Rollouts blue/green. NOT installed in Phase 1.
+# Flipping this to true (with canary.enabled false) will render a Rollout with
+# preview/active Services instead of the plain Deployment.
+# ---------------------------------------------------------------------------
+blueGreen:
+  enabled: false
+  autoPromotionEnabled: false
+  scaleDownDelaySeconds: 30
+  previewService: preview
+  activeService: active
+
+# ---------------------------------------------------------------------------
+# PHASE 3 — Argo Rollouts canary. NOT installed in Phase 1.
+# ---------------------------------------------------------------------------
+canary:
+  enabled: false
+  steps:
+    - setWeight: 20
+    - pause: {duration: 60}
+    - setWeight: 50
+    - pause: {duration: 60}
+  analysis:
+    enabled: false

@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# APP-OF-APPS ROOT
+#
+# The only object the pipeline applies directly. It renders gitops/apps/ as a
+# Helm chart and creates every Application defined there, so adding an
+# environment later means committing one template — never touching CI.
+#
+# $GITOPS_REPO_URL is substituted by the configure stage (envsubst) at apply
+# time and passed DOWN to the children as a Helm parameter, so no manifest in
+# this repository hardcodes an org/repo pair.
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: ${GITOPS_REPO_URL}
+    targetRevision: main
+    path: gitops/apps
+    helm:
+      releaseName: root
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: repoURL
+          value: ${GITOPS_REPO_URL}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    # Safe because Argo CD is the SOLE writer of gitops/ and chart/: the
+    # pipeline never commits to either path, so selfHeal has nothing to fight.
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,29 @@
+# udap:meta cloud=aws region=us-east-1 target=eks
+
+dev: Developer { shape: person; udap-type: generic.user }
+user: End User { shape: person; udap-type: generic.user }
+repo: GitHub Repo (app + chart + gitops + infra) { shape: cylinder; udap-type: generic.app }
+ci: GitHub Actions (test - security - image - provision - configure - verify) { udap-type: generic.app }
+ecr: ECR Repository { udap-type: aws.ecr }
+vpc: VPC 10.0.0.0/16 (public + private subnets) {
+  alb: Application Load Balancer (public subnets) { udap-type: aws.alb }
+  eks: EKS Control Plane gitops-delivery-platfor-eks { udap-type: aws.eks }
+  nodes: Managed Node Group t3.medium x2 (private subnets) { udap-type: aws.ec2 }
+  argocd: Argo CD (namespace argocd) { udap-type: generic.app }
+  albc: AWS Load Balancer Controller (IRSA) { udap-type: generic.app }
+  app: Spring Boot App (Helm chart - Deployment) { udap-type: generic.app }
+}
+
+dev -> repo: git push
+repo -> ci: workflow_dispatch (platform trigger)
+ci -> ecr: build and push image tag=commit SHA
+ci -> vpc.eks: terraform apply - cluster and node group
+ci -> vpc.argocd: helm install argocd - apply root-app
+ci -> vpc.app: kubectl patch Application - image tag parameter
+vpc.argocd -> repo: poll gitops/ and chart/ (desired state)
+vpc.argocd -> vpc.app: sync - prune - selfHeal
+vpc.nodes -> ecr: pull image
+vpc.albc -> vpc.alb: provision from Ingress
+user -> vpc.alb: HTTP
+vpc.alb -> vpc.app: route to Service
+vpc.eks -> vpc.nodes: schedules pods

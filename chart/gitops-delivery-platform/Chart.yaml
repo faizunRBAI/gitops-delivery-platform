@@ -1,0 +1,10 @@
+apiVersion: v2
+name: gitops-delivery-platform
+description: Spring Boot service delivered by Argo CD on Amazon EKS
+type: application
+
+# Chart version tracks the chart's own shape. appVersion is intentionally a
+# placeholder: the running image tag is set by Argo CD as a Helm parameter on
+# the Application object, never committed here.
+version: 0.1.0
+appVersion: "0.1.0"
