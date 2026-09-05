@@ -39,6 +39,11 @@ stages:
           # during action resolution with no scan attempted. An image tag is
           # verified at pull time by the registry and fails with a clear error.
           TRIVY_IMAGE="aquasec/trivy:0.58.1"
+          # --ignorefile points at .trivyignore.yaml, which carries SCOPED and
+          # EXPIRING exceptions with written justifications. It currently holds
+          # exactly one entry (AVD-AWS-0040, EKS public endpoint) that cannot be
+          # closed without a self-hosted runner inside the VPC. The severity gate
+          # below is NOT relaxed.
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
@@ -47,6 +52,7 @@ stages:
             --scanners vuln,secret,misconfig \
             --severity HIGH,CRITICAL \
             --ignore-unfixed \
+            --ignorefile /workspace/.trivyignore.yaml \
             --exit-code 1 \
             --no-progress \
             /workspace

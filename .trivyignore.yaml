@@ -1,0 +1,27 @@
+# Trivy ignore file - SCOPED, DOCUMENTED, EXPIRING exceptions only.
+#
+# The security stage gate is unchanged: --severity HIGH,CRITICAL --exit-code 1.
+# Nothing here suppresses a finding we could actually fix; each entry states the
+# structural reason it cannot be fixed in Phase 1 and what closes it.
+#
+# Everything else Trivy found on 2026-09-05 was FIXED, not ignored:
+#   AVD-AWS-0039  EKS secret encryption      -> KMS CMK + encryption_config added
+#   AVD-AWS-0164  public-IP-on-launch subnet -> map_public_ip_on_launch removed
+#   CVE-2026-22731/22733 actuator auth bypass -> Spring Boot 3.4.1 -> 3.5.12
+
+misconfigurations:
+  - id: AVD-AWS-0040
+    paths:
+      - "infra/eks.tf"
+    statement: >-
+      "Public cluster access is enabled." The EKS API endpoint must stay
+      publicly reachable in Phase 1 because the configure stage runs helm and
+      kubectl from a GitHub-hosted runner, which lives outside the VPC and has
+      no fixed egress IP. Disabling public access requires a self-hosted runner
+      inside the VPC (or a bastion + tunnel) and is tracked as Phase 2 network
+      hardening. Mitigations already in place: private endpoint access enabled
+      so in-VPC traffic never leaves the network; IAM authentication in API mode
+      (network reachability is not authorization); public_access_cidrs is an
+      explicit variable ready to be narrowed to a runner egress range; API,
+      audit and authenticator logs shipped to CloudWatch.
+    expiredAt: 2026-12-31

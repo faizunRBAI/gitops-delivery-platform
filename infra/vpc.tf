@@ -37,16 +37,26 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-# Public subnets host the ALB. kubernetes.io/role/elb=1 is REQUIRED for the AWS
-# Load Balancer Controller to auto-discover where to place an internet-facing
-# load balancer; without it the Ingress stays pending forever.
+# Public subnets host the ALB and the NAT gateway - nothing else. The worker
+# nodes live in the private subnets, so NOTHING we own is launched here with an
+# instance profile or an application on it.
+#
+# map_public_ip_on_launch is therefore left at its default of false
+# (AVD-AWS-0164). It was previously true, which would have auto-assigned a
+# public IP to any future instance launched into these subnets - a
+# fail-open default this stack never needs. The ALB gets its public addresses
+# from the ELB service, not from this flag, and the NAT gateway uses an explicit
+# aws_eip. Verified: no resource in this stack depends on the removed behaviour.
+#
+# kubernetes.io/role/elb=1 is REQUIRED for the AWS Load Balancer Controller to
+# auto-discover where to place an internet-facing load balancer; without it the
+# Ingress stays pending forever. That tag is untouched.
 resource "aws_subnet" "public" {
   count = length(local.public_subnet_cidrs)
 
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = local.public_subnet_cidrs[count.index]
-  availability_zone       = local.azs[count.index]
-  map_public_ip_on_launch = true
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = local.public_subnet_cidrs[count.index]
+  availability_zone = local.azs[count.index]
 
   tags = {
     Name                                          = "${var.project_name}-public-${local.azs[count.index]}"

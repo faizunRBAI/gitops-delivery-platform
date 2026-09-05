@@ -1,6 +1,31 @@
 data "aws_caller_identity" "current" {}
 
 # ---------------------------------------------------------------------------
+# Envelope encryption key for Kubernetes Secrets (AVD-AWS-0039)
+#
+# Without an encryption_config block, Secrets are stored in etcd base64-encoded
+# but NOT encrypted at rest. Argo CD holds real credentials in argocd-secret
+# (and would hold the repository credential if this repo were private), so this
+# is a genuine gap rather than a checkbox. A customer-managed KMS key with
+# rotation is ~$1/month.
+# ---------------------------------------------------------------------------
+
+resource "aws_kms_key" "eks_secrets" {
+  description             = "Envelope encryption for ${local.cluster_name} Kubernetes secrets"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = {
+    Name = "${local.cluster_name}-secrets-kms"
+  }
+}
+
+resource "aws_kms_alias" "eks_secrets" {
+  name          = "alias/${local.cluster_name}-secrets"
+  target_key_id = aws_kms_key.eks_secrets.key_id
+}
+
+# ---------------------------------------------------------------------------
 # Control plane IAM
 # ---------------------------------------------------------------------------
 
@@ -26,6 +51,26 @@ resource "aws_iam_role_policy_attachment" "cluster_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
+# The control plane needs to use the CMK to envelope-encrypt Secrets.
+data "aws_iam_policy_document" "cluster_kms" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ListGrants",
+      "kms:DescribeKey",
+    ]
+    resources = [aws_kms_key.eks_secrets.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "cluster_kms" {
+  name   = "${local.cluster_name}-cluster-kms"
+  role   = aws_iam_role.cluster.id
+  policy = data.aws_iam_policy_document.cluster_kms.json
+}
+
 # ---------------------------------------------------------------------------
 # Cluster
 # ---------------------------------------------------------------------------
@@ -35,10 +80,31 @@ resource "aws_eks_cluster" "main" {
   role_arn = aws_iam_role.cluster.arn
   version  = var.cluster_version
 
+  # PUBLIC ENDPOINT ACCESS IS RESTRICTED (AVD-AWS-0040).
+  #
+  # The GitHub-hosted CI runner has no fixed egress address and lives outside
+  # the VPC, so it can only reach the Kubernetes API over the public endpoint --
+  # `configure` runs helm/kubectl against it. Disabling public access entirely
+  # would require a self-hosted runner inside the VPC or a bastion, which is a
+  # Phase 2 change, not a one-line flip.
+  #
+  # What IS tightened: public_access_cidrs is now an explicit variable instead
+  # of the implicit 0.0.0.0/0 default, private access stays on (so in-VPC
+  # traffic never leaves the network), and authentication is API-mode IAM.
+  # Narrow var.cluster_public_access_cidrs to your egress range if you move to
+  # a self-hosted or static-IP runner.
   vpc_config {
     subnet_ids              = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
     endpoint_public_access  = true
     endpoint_private_access = true
+    public_access_cidrs     = var.cluster_public_access_cidrs
+  }
+
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks_secrets.arn
+    }
+    resources = ["secrets"]
   }
 
   # API mode lets the creating principal (the CI user) administer the cluster
@@ -54,7 +120,10 @@ resource "aws_eks_cluster" "main" {
     Name = local.cluster_name
   }
 
-  depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+  depends_on = [
+    aws_iam_role_policy_attachment.cluster_policy,
+    aws_iam_role_policy.cluster_kms,
+  ]
 }
 
 # ---------------------------------------------------------------------------

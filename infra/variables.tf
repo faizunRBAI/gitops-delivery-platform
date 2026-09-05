@@ -14,6 +14,12 @@ variable "cluster_version" {
   default     = "1.33"
 }
 
+variable "cluster_public_access_cidrs" {
+  description = "CIDRs allowed to reach the EKS public API endpoint. The GitHub-hosted CI runner has no fixed egress IP, so Phase 1 must allow 0.0.0.0/0 for the configure stage to run helm/kubectl at all. Narrow this to your runner's egress range (or move to a self-hosted runner inside the VPC and disable public access) as a Phase 2 hardening step. Authentication is IAM in API mode regardless — this controls network reachability, not authorization."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the dedicated VPC."
   type        = string

@@ -4,10 +4,24 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
+  <!--
+    Spring Boot 3.5.12 (was 3.4.1).
+
+    Trivy flagged two HIGH authentication-bypass CVEs in
+    spring-boot-starter-actuator at 3.4.1, both fixed in 3.5.12:
+      CVE-2026-22731 - bypass via misconfigured Health Group additional path
+      CVE-2026-22733 - bypass under Actuator CloudFoundry endpoints
+    This service exposes /actuator/health as its Kubernetes liveness/readiness
+    probe AND as the public ALB health check, so the actuator surface is
+    genuinely reachable - these are not theoretical findings.
+
+    3.5.x was chosen over 4.0.x deliberately: 4.0 is a major release with
+    breaking changes, and 3.5 is a minor bump on the same Java 21 baseline.
+  -->
   <parent>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-parent</artifactId>
-    <version>3.4.1</version>
+    <version>3.5.12</version>
     <relativePath/>
   </parent>
 
