@@ -1,47 +1,25 @@
 # ---------------------------------------------------------------------------
 # APP-OF-APPS VALUES — the DESIRED STATE of every environment.
 #
-# repoURL is supplied by the ROOT Application as a Helm parameter, set once at
-# bootstrap by the configure stage from $GITOPS_REPO_URL. Keeping it out of Git
-# means these manifests carry no hardcoded org/repo pair and work in a fork.
+# GENERATED AND COMMITTED BY CI (the image stage, and the rollback
+# workflow). Edit by hand only to pin or roll a version deliberately —
+# Argo CD reconciles whatever is committed here.
 #
-# EVERYTHING ELSE IN THIS FILE IS GIT STATE, AND THAT IS THE POINT.
-#
-# The running image tag USED TO be written onto the child Applications with
-# `kubectl patch` from the configure stage, while Git declared an empty
-# `parameters: []`. That made the cluster and Git disagree BY DESIGN and left
-# the root Application's selfHeal permanently racing CI: whichever wrote last
-# won. It was survivable only with an ignoreDifferences exemption on the root,
-# a repo-server cache-bust, and an assertion step to catch the revert — three
-# workarounds defending one inverted design. On 2026-09-05 app-bluegreen lost
-# that race and deployed nothing while app-canary won it and deployed fine.
-#
-# Now CI COMMITS the tag here and Argo CD syncs it because it IS the desired
-# state. selfHeal has nothing to fight, so all three workarounds are gone.
-#
-# WRITTEN BY: the `image` stage (after a successful push) and the `rollback`
-# workflow. Both use the same heredoc rewrite, so the file's shape is stable
-# and a human can also edit it by hand and let Argo reconcile.
+# The image tag lives in GIT, not in a kubectl patch against the live
+# Applications. That is what lets root's selfHeal stay on permanently:
+# cluster state and Git state agree, so there is nothing to fight and
+# no ignoreDifferences exemption hiding a disagreement.
 # ---------------------------------------------------------------------------
 repoURL: ""
 
 targetRevision: main
 chartPath: chart/gitops-delivery-platform
 
-# The ECR repository, from `terraform output -raw ecr_repository_url`. Shared by
-# all three environments — one registry, one image, many release strategies.
-imageRepository: ""
+# The ECR repository, from: terraform output -raw ecr_repository_url
+imageRepository: "241533126054.dkr.ecr.us-east-1.amazonaws.com/gitops-delivery-platform"
 
-# PER-ENVIRONMENT IMAGE TAGS (commit SHAs).
-#
-# Separate keys rather than one shared value so a rollback can move ONE
-# environment back without dragging the others with it — that is what the
-# rollback workflow's ROLLBACK_APPLICATION variable selects. A normal deploy
-# writes the same new SHA to all three.
-#
-# Empty is a HARD FAILURE, not a default: each child Application's template
-# `fail`s on an empty tag, and the chart's `app.image` helper fails again. A
-# missing tag must never quietly render `image: repo:` .
-imageTagDev: ""
-imageTagBluegreen: ""
-imageTagCanary: ""
+# PER-ENVIRONMENT IMAGE TAGS (commit SHAs). Separate keys so a rollback
+# can move ONE environment back without dragging the others with it.
+imageTagDev: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
+imageTagBluegreen: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
+imageTagCanary: "aa458682f51bbb76bf28c8b287b37f5d3869cc70"
