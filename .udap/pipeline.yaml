@@ -193,33 +193,20 @@ stages:
             --set serviceAccount.name=aws-load-balancer-controller \
             --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$(cat /tmp/albc_role_arn)" \
             --wait --timeout 10m
-      - name: Create Argo CD repository credentials
-        env:
-          GITOPS_TOKEN: ${{ secrets.GITOPS_PAT }}
+      - name: Confirm the GitOps repository is anonymously readable
         run: |
           set -euo pipefail
-          # Argo CD reconciles from INSIDE the cluster, so it cannot use
-          # GITHUB_TOKEN - it needs its own read-only credential. The value comes
-          # from the GITOPS_PAT repo secret via the step env above; it is piped
-          # straight into kubectl on stdin, so it is never a command-line
-          # argument (visible in the process list) and never written to disk.
-          KEY_TOKEN="pass""word"
-          umask 077
-          {
-            echo "apiVersion: v1"
-            echo "kind: Secret"
-            echo "metadata:"
-            echo "  name: gitops-repo-creds"
-            echo "  namespace: argocd"
-            echo "  labels:"
-            echo "    argocd.argoproj.io/secret-type: repository"
-            echo "type: Opaque"
-            echo "stringData:"
-            echo "  type: git"
-            echo "  url: ${GITOPS_REPO_URL}"
-            echo "  username: git"
-            printf '  %s: %s\n' "$KEY_TOKEN" "$GITOPS_TOKEN"
-          } | kubectl apply -f -
+          # This repository is PUBLIC by deliberate choice, so Argo CD clones it
+          # anonymously and no repository-credential Secret exists. Fail fast and
+          # loudly here if that assumption ever stops holding - otherwise the
+          # symptom appears minutes later as an opaque "Unknown" Application.
+          if ! git ls-remote "${GITOPS_REPO_URL}.git" HEAD >/dev/null 2>&1; then
+            echo "ERROR: ${GITOPS_REPO_URL} is not readable without credentials."
+            echo "Either make the repository public again, or add a read-only"
+            echo "GITOPS_PAT secret and restore the repository-credential step."
+            exit 1
+          fi
+          echo "OK: repository is anonymously readable"
       - name: Apply app-of-apps root Application
         run: |
           set -euo pipefail

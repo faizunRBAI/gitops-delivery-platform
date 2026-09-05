@@ -9,6 +9,10 @@ reconciled into the cluster by Argo CD.
 > single `app-dev` Application. Argo Rollouts, blue/green, canary, observability
 > and Flux are deliberately deferred — see [Deferred phases](#deferred-phases).
 
+> **This repository is PUBLIC by design.** Argo CD clones it anonymously, so no
+> repository-credential Secret and no personal access token exist anywhere in
+> the system. See [Repository visibility](#repository-visibility).
+
 ---
 
 ## Repository layout
@@ -63,7 +67,7 @@ so no commit can retrigger anything. The guards would be cargo cult here.
 | `security` | OWASP Dependency-Check + Trivy filesystem scan (HIGH/CRITICAL fail) |
 | `image` | Builds the jar, builds the image, pushes to ECR tagged with the commit SHA |
 | `provision` | `terraform init -reconfigure` + `apply` over `infra/` |
-| `configure` | Argo CD install, ALB controller, repo credentials, root app, image-tag patch |
+| `configure` | Argo CD install, ALB controller, anonymous-read check, root app, image-tag patch |
 | `verify` | Polls `root` and `app-dev` for `Synced` + `Healthy`, then curls the ALB |
 
 **Every stage that needs an infrastructure value reads it itself** by re-running
@@ -74,18 +78,43 @@ appears inside every resource name here.
 
 ---
 
+## Repository visibility
+
+Argo CD reconciles from *inside* the cluster, so it cannot use the workflow's
+`GITHUB_TOKEN`. There are two ways to give it read access, and this project uses
+the second:
+
+1. **A read-only PAT** stored as a `GITOPS_PAT` repo secret, which the configure
+   stage turns into an Argo CD repository-credential Secret.
+2. **A public repository**, cloned anonymously — no token anywhere. ← *in use*
+
+Because option 2 is a *deployment-blocking* assumption, the configure stage
+checks it explicitly with `git ls-remote` before applying the root Application.
+If the repository is ever made private, that check fails immediately with
+instructions, rather than leaving an Application stuck at `Unknown` for ten
+minutes with an opaque authentication error.
+
+**What being public means here:** the Terraform, the pipeline spec and the
+application source are world-readable. That is safe *only because* no secret
+values live in this repository — every credential is a `${{ secrets.NAME }}`
+reference resolved by CI at run time, and the platform's secret scanner gates
+each commit. Do not commit a real value on the assumption nobody is looking.
+
+To switch back to a private repository: make it private on GitHub, add a
+fine-grained PAT with **Contents: Read-only** as the `GITOPS_PAT` secret, and
+restore the repository-credential step in the configure stage.
+
+---
+
 ## Secrets
 
 | Secret | Source |
 |---|---|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Set by the platform |
 | `TF_STATE_BUCKET`, `PROJECT_NAME` | Set by the platform |
-| `GITOPS_PAT` | **You must supply this** |
 
-`GITOPS_PAT` is a fine-grained PAT with **read-only Contents** on this repo.
-Argo CD reconciles from *inside* the cluster, so it cannot use `GITHUB_TOKEN`;
-the configure stage turns this PAT into an Argo CD repository-credential Secret.
-No GHCR token exists anywhere — ECR authentication reuses the AWS credentials.
+No project-specific secrets. ECR authentication reuses the AWS credentials; no
+GHCR token and no GitOps PAT exist.
 
 ---
 
