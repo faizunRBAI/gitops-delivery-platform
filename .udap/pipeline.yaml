@@ -162,6 +162,20 @@ stages:
           echo "==================================================================="
         working-directory: infra
 
+  # ---------------------------------------------------------------------------
+  # IMAGE — build, push, and COMMIT THE NEW VERSION TO GIT.
+  #
+  # This stage is where the GitOps loop is closed. It pushes the image, then
+  # writes the tag into gitops/apps/values.yaml and commits it. Argo CD then
+  # deploys that tag because it is the DESIRED STATE in the repository - not
+  # because CI reached into the cluster and patched it there.
+  #
+  # The previous design patched the tag onto the live Argo Applications with
+  # `kubectl patch` while Git declared an empty parameters list. Cluster and Git
+  # disagreed by construction, root's selfHeal raced CI on every deploy, and the
+  # race was lost on 2026-09-05. Writing to Git removes the race rather than
+  # exempting it.
+  # ---------------------------------------------------------------------------
   - id: image
     kind: build_push
     needs: [provision]
@@ -174,6 +188,14 @@ stages:
       TF_VAR_aws_region: us-east-1
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+    # The commit the write-back created. configure pins the root Application's
+    # targetRevision to it.
+    #
+    # SAFE AS A JOB OUTPUT: a git SHA is a hex digest that contains no secret
+    # substring, so GitHub will not drop it (unlike the ECR URL, which embeds
+    # PROJECT_NAME and must be re-read from terraform state in each job).
+    outputs:
+      gitops_sha: ${{ steps.writeback.outputs.gitops_sha }}
     steps:
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -223,6 +245,70 @@ stages:
           docker build -t "$IMAGE" app
           docker push "$IMAGE"
           echo "pushed image for $GITHUB_SHA"
+      - name: Write the new image tag into gitops/apps/values.yaml and commit
+        id: writeback
+        env:
+          # The built-in token, scoped to this repository. The rendered workflow
+          # grants `contents: write` at job level. No PAT is stored anywhere.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ECR_URL="$(cat /tmp/ecr_url)"
+          # REWRITTEN WHOLESALE WITH A HEREDOC, not edited in place with sed.
+          # The ECR URL contains slashes and dots; a sed s/// expression over it
+          # is a delimiter bug waiting to happen (known pitfall #11). The file is
+          # small and fully owned by this stage, so emitting it entire is both
+          # safer and easier to read in a diff.
+          #
+          # The delimiter is UNQUOTED so ${ECR_URL} and ${GITHUB_SHA} expand;
+          # every literal $ and backtick in the body is therefore escaped.
+          cat > gitops/apps/values.yaml <<EOF
+          # ---------------------------------------------------------------------------
+          # APP-OF-APPS VALUES — the DESIRED STATE of every environment.
+          #
+          # GENERATED AND COMMITTED BY CI (the image stage, and the rollback
+          # workflow). Edit by hand only to pin or roll a version deliberately —
+          # Argo CD reconciles whatever is committed here.
+          #
+          # The image tag lives in GIT, not in a kubectl patch against the live
+          # Applications. That is what lets root's selfHeal stay on permanently:
+          # cluster state and Git state agree, so there is nothing to fight and
+          # no ignoreDifferences exemption hiding a disagreement.
+          # ---------------------------------------------------------------------------
+          repoURL: ""
+
+          targetRevision: main
+          chartPath: chart/gitops-delivery-platform
+
+          # The ECR repository, from: terraform output -raw ecr_repository_url
+          imageRepository: "${ECR_URL}"
+
+          # PER-ENVIRONMENT IMAGE TAGS (commit SHAs). Separate keys so a rollback
+          # can move ONE environment back without dragging the others with it.
+          imageTagDev: "${GITHUB_SHA}"
+          imageTagBluegreen: "${GITHUB_SHA}"
+          imageTagCanary: "${GITHUB_SHA}"
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # IDEMPOTENT. Re-running the pipeline on the SAME commit produces an
+          # identical file; `git commit` with nothing staged exits non-zero and
+          # would fail the job. Detect that and reuse the current HEAD instead.
+          if git diff --quiet -- gitops/apps/values.yaml; then
+            echo "gitops/apps/values.yaml already names ${GITHUB_SHA} - no commit needed"
+            GITOPS_SHA="$(git rev-parse HEAD)"
+          else
+            git add gitops/apps/values.yaml
+            git commit -m "deploy: set image tag to ${GITHUB_SHA}"
+            # Rebase onto any concurrent commit rather than force-pushing over
+            # it. Deploys are workflow_dispatch-only and single-writer, so this
+            # is belt and braces, not an expected path.
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            GITOPS_SHA="$(git rev-parse HEAD)"
+            echo "committed ${GITOPS_SHA}"
+          fi
+          echo "gitops_sha=${GITOPS_SHA}" >> "$GITHUB_OUTPUT"
 
   - id: configure
     kind: configure
@@ -239,6 +325,13 @@ stages:
       GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       ARGOCD_ADMIN_PASSWORD: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+      # The commit the image stage wrote the new tag into. This job checked out
+      # that commit's PARENT (the SHA that triggered the run), so the root
+      # Application must be pointed at the write-back SHA explicitly - otherwise
+      # Argo would sync a revision whose values.yaml still names the previous
+      # image, and the deploy would only converge if Argo happened to poll main
+      # later. Pinning makes it deterministic.
+      GITOPS_TARGET_REVISION: ${{ needs.image.outputs.gitops_sha }}
       # Argo Rollouts controller version. Pinned for the same reason every chart
       # here is pinned: an unpinned "latest" manifest changes the CRD schema
       # under a running cluster with no commit to point at.
@@ -460,98 +553,71 @@ stages:
       - name: Apply app-of-apps root Application
         run: |
           set -euo pipefail
-          export GITOPS_REPO_URL
+          # Fail loudly if the image stage's write-back SHA did not arrive.
+          # An empty targetRevision renders as `targetRevision: ""`, which Argo
+          # treats as HEAD of the default branch - it would probably work, and
+          # that is exactly the problem: an invisible fallback to "whatever main
+          # happens to be" is how a deploy silently ships the wrong version.
+          if [ -z "${GITOPS_TARGET_REVISION:-}" ]; then
+            echo "ERROR: GITOPS_TARGET_REVISION is empty."
+            echo "It comes from needs.image.outputs.gitops_sha, set by the image"
+            echo "stage's write-back step. An empty value means that step did"
+            echo "not run or did not export its output."
+            exit 1
+          fi
+          echo "pinning the root Application to ${GITOPS_TARGET_REVISION}"
+          export GITOPS_REPO_URL GITOPS_TARGET_REVISION
           envsubst < gitops/root-app.yaml | kubectl apply -f -
-      - name: Patch the image tag onto every application
+      - name: Wait for every Application to converge on the committed image tag
         run: |
           set -euo pipefail
-          ECR_URL="$(cat /tmp/ecr_url)"
-          # The root Application creates the children; wait for each to exist
-          # before patching. This is cluster state - the repository is never
-          # modified, which is what lets selfHeal stay on permanently.
+          # THIS REPLACES THREE STEPS that the patch mechanism required: a
+          # `kubectl patch` loop, a repo-server cache-bust restart, and an
+          # assertion that the patch had not been reverted.
           #
-          # BOTH parameters are always sent together. The patch is a MERGE patch
-          # and `parameters` is a LIST, so a merge REPLACES the whole list
-          # rather than adding to it. Sending image.tag alone would delete
-          # image.repository and the chart's `app.image` helper would fail the
-          # render with "image.repository is empty".
+          # None of them are needed now. The tag is committed in
+          # gitops/apps/values.yaml, root is pinned to that exact commit, and
+          # Argo renders the children from Git - so the parameters cannot be
+          # "reverted", there is no stale failed render to bust (the first
+          # render already carries a valid tag), and nothing writes to the
+          # cluster that Git disagrees with.
+          #
+          # What remains is an honest WAIT: confirm each Application actually
+          # reports the tag we committed. This proves the loop closed rather
+          # than assuming it did.
+          EXPECTED="$GITHUB_SHA"
           for APP in app-dev app-bluegreen app-canary; do
-            echo "--- $APP"
-            DEADLINE=$((SECONDS + 300))
+            echo "--- $APP (expecting image.tag=${EXPECTED})"
+            DEADLINE=$((SECONDS + 420))
             until kubectl get application "$APP" -n argocd >/dev/null 2>&1; do
               if [ "$SECONDS" -ge "$DEADLINE" ]; then
-                echo "Application $APP was not created by the root app in time"
+                echo "ERROR: the root Application did not create ${APP} in time."
                 kubectl get applications -n argocd
+                kubectl get application root -n argocd -o jsonpath='{.status.conditions}'
                 exit 1
               fi
               sleep 10
             done
-            kubectl patch application "$APP" --namespace argocd --type merge \
-              --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${GITHUB_SHA}\"}]}}}}"
-            echo "patched $APP to ${GITHUB_SHA}"
-          done
-      - name: Refresh the repo-server cache so the patch is rendered
-        run: |
-          set -euo pipefail
-          # THE ORDERING ARTEFACT THIS CLOSES.
-          #
-          # On a fresh cluster the root Application creates each child with an
-          # empty `parameters: []`. Argo CD renders it immediately, the chart's
-          # image guard fails, and the repo-server CACHES that failure. The
-          # patch above then lands - but Argo keeps serving the STALE cached
-          # error once its retry backoff is spent, and the Application sits at
-          # sync=Unknown with a ComparisonError reading "(cached)".
-          #
-          # That exact state was previously cleared BY HAND with this same
-          # restart. Doing it here makes the fix part of the deploy instead of
-          # tribal knowledge. It is cheap and harmless when nothing was cached.
-          #
-          # A hard refresh annotation alone is NOT sufficient: it re-renders but
-          # can still be served from the failed-render cache. Restarting the
-          # repo-server empties that cache outright.
-          kubectl -n argocd rollout restart deployment argocd-repo-server
-          kubectl -n argocd rollout status deployment argocd-repo-server --timeout=5m
-          # Ask each Application to re-compare against a freshly rendered source.
-          for APP in app-dev app-bluegreen app-canary; do
-            kubectl -n argocd annotate application "$APP" \
-              argocd.argoproj.io/refresh=hard --overwrite
-          done
-          echo "repo-server cache cleared and a hard refresh requested"
-      - name: Confirm the image parameters survived root's reconciliation
-        run: |
-          set -euo pipefail
-          # The patch above writes CLUSTER state onto objects that the ROOT
-          # Application manages from Git, where they are rendered with an empty
-          # `parameters: []`. root therefore has ignoreDifferences on
-          # /spec/source/helm/parameters - without it, selfHeal reverts the
-          # patch within seconds and the child sits at sync=Unknown forever with
-          # "image.repository is empty" (that is exactly how a previous deploy
-          # failed).
-          #
-          # ignoreDifferences is easy to attach to the wrong Application and
-          # fails SILENTLY when it is, so assert the outcome here rather than
-          # trusting the patch. Watch across several reconcile loops: a revert
-          # is not instantaneous.
-          DEADLINE=$((SECONDS + 180))
-          while true; do
-            for APP in app-dev app-bluegreen app-canary; do
+            while true; do
               TAG="$(kubectl get application "$APP" -n argocd \
                 -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
-              if [ "$TAG" != "$GITHUB_SHA" ]; then
-                echo "ERROR: image.tag on ${APP} is '${TAG:-<empty>}', expected the commit SHA."
-                echo "The root Application reverted the patch, which means its"
-                echo "ignoreDifferences for /spec/source/helm/parameters is missing"
-                echo "or attached to the wrong Application."
-                kubectl get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'
+              if [ "$TAG" = "$EXPECTED" ]; then
+                echo "  OK: ${APP} is on ${EXPECTED}"
+                break
+              fi
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                echo "ERROR: ${APP} reports image.tag='${TAG:-<empty>}', expected ${EXPECTED}."
+                echo "root is pinned to ${GITOPS_TARGET_REVISION}; check that the"
+                echo "write-back commit contains that tag and that root synced it."
+                kubectl get application root -n argocd -o jsonpath='{.status.conditions}'
+                echo
+                kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
                 exit 1
               fi
+              sleep 15
             done
-            if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "OK: image parameters stable on all applications for 180s"
-              break
-            fi
-            sleep 15
           done
+          echo "all applications converged on ${EXPECTED} from Git"
 
   - id: verify
     kind: verify
@@ -609,9 +675,7 @@ stages:
                 echo "timed out waiting for $APP (sync=$SYNC health=$HEALTH)"
                 # sync=Unknown means Argo could not RENDER the source. The
                 # ComparisonError condition carries the helm template error and
-                # is far more useful than the describe output alone. A "(cached)"
-                # prefix means a STALE failed render - the configure stage's
-                # repo-server restart is what clears it.
+                # is far more useful than the describe output alone.
                 kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
                 echo
                 kubectl describe application "$APP" -n argocd
@@ -757,6 +821,7 @@ pipelines:
           TF_VAR_aws_region: us-east-1
           TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
           PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
           # HOW THE OPERATOR SUPPLIES THE TARGET.
           #
           # Through REPOSITORY VARIABLES, not workflow_dispatch inputs. The
@@ -802,8 +867,11 @@ pipelines:
                 echo "Then run this workflow again."
                 exit 1
               fi
+              # Map the application to the values.yaml key holding its tag.
               case "$APP" in
-                app-dev|app-bluegreen|app-canary) ;;
+                app-dev)       KEY="imageTagDev" ;;
+                app-bluegreen) KEY="imageTagBluegreen" ;;
+                app-canary)    KEY="imageTagCanary" ;;
                 *)
                   echo "ERROR: ROLLBACK_APPLICATION must be one of"
                   echo "  app-dev, app-bluegreen, app-canary"
@@ -812,7 +880,8 @@ pipelines:
                   ;;
               esac
               echo "APP=${APP}" >> "$GITHUB_ENV"
-              echo "rollback target: ${APP} -> ${ROLLBACK_TAG}"
+              echo "TAG_KEY=${KEY}" >> "$GITHUB_ENV"
+              echo "rollback target: ${APP} (${KEY}) -> ${ROLLBACK_TAG}"
           - name: Read infrastructure outputs from terraform state
             run: |
               set -euo pipefail
@@ -823,15 +892,15 @@ pipelines:
                 -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
                 -backend-config="region=us-east-1"
               terraform output -raw cluster_name > /tmp/cluster_name
-              terraform output -raw ecr_repository_url > /tmp/ecr_url
             working-directory: infra
           - name: Confirm the requested tag exists in ECR
             run: |
               set -euo pipefail
-              # FAIL BEFORE TOUCHING THE CLUSTER. Patching an Application to a
-              # tag that was never pushed produces ImagePullBackOff on every new
-              # pod - a broken deployment created BY the rollback that was meant
-              # to fix one. Checking ECR first turns that into a clean refusal.
+              # FAIL BEFORE COMMITTING ANYTHING. Rolling the repository to a tag
+              # that was never pushed produces ImagePullBackOff on every new pod
+              # - a broken deployment created BY the rollback that was meant to
+              # fix one. Checking ECR first turns that into a clean refusal with
+              # nothing written to Git.
               if ! aws ecr describe-images --region "$AWS_REGION" \
                      --repository-name "$PROJECT_NAME" \
                      --image-ids imageTag="$ROLLBACK_TAG" >/dev/null 2>&1; then
@@ -844,40 +913,81 @@ pipelines:
                 exit 1
               fi
               echo "OK: ${ROLLBACK_TAG} exists in ECR"
-          - name: Update kubeconfig
+          - name: Commit the rollback to gitops/apps/values.yaml
+            env:
+              GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
             run: |
               set -euo pipefail
-              aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
-              kubectl cluster-info
-          - name: Patch the Application back to the requested tag
-            run: |
-              set -euo pipefail
-              ECR_URL="$(cat /tmp/ecr_url)"
-              # Record what we are moving away from, so the log alone is enough
-              # to undo the rollback.
-              PREVIOUS="$(kubectl get application "$APP" -n argocd \
-                -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+              # A ROLLBACK IS A COMMIT, not a patch against the cluster.
+              #
+              # This used to `kubectl patch` the live Application, which left
+              # Git still naming the broken version: the next deploy - or any
+              # selfHeal pass - would quietly roll forward again onto the exact
+              # image the operator had just backed away from. Writing the old
+              # tag to Git makes the rollback durable and auditable, and Argo CD
+              # applies it the same way it applies every other change.
+              PREVIOUS="$(grep -E "^${TAG_KEY}:" gitops/apps/values.yaml \
+                | sed -E 's/^[^:]+:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
               echo "rolling ${APP}: ${PREVIOUS:-<unset>} -> ${ROLLBACK_TAG}"
-              # BOTH parameters again - a merge patch replaces the whole list,
-              # so omitting image.repository would blank it and fail the render.
-              kubectl patch application "$APP" --namespace argocd --type merge \
-                --patch "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"image.repository\",\"value\":\"${ECR_URL}\"},{\"name\":\"image.tag\",\"value\":\"${ROLLBACK_TAG}\"}]}}}}"
+              if [ "$PREVIOUS" = "$ROLLBACK_TAG" ]; then
+                echo "${APP} already names ${ROLLBACK_TAG} - nothing to roll back."
+                exit 0
+              fi
+              # Rewrite only this environment's key, leaving the other two
+              # untouched. python rather than sed: the replacement is inserted
+              # literally, and sed's & and / are landmines here (pitfall #11).
+              python3 - "$TAG_KEY" "$ROLLBACK_TAG" <<'PY'
+              import re, sys
+              key, tag = sys.argv[1], sys.argv[2]
+              path = "gitops/apps/values.yaml"
+              src = open(path).read()
+              new, n = re.subn(rf'^{re.escape(key)}:.*$', f'{key}: "{tag}"',
+                               src, count=1, flags=re.M)
+              if n != 1:
+                  sys.exit(f"ERROR: key {key} not found in {path}")
+              open(path, "w").write(new)
+              print(f"set {key} to {tag}")
+              PY
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add gitops/apps/values.yaml
+              git commit -m "rollback: ${APP} to ${ROLLBACK_TAG} (was ${PREVIOUS:-unset})"
+              git pull --rebase origin "${GITHUB_REF_NAME}"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+              echo "ROLLBACK_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
               {
                 echo "### Rollback"
                 echo ""
                 echo "| field | value |"
                 echo "| --- | --- |"
                 echo "| application | \`${APP}\` |"
+                echo "| values key | \`${TAG_KEY}\` |"
                 echo "| previous tag | \`${PREVIOUS:-<unset>}\` |"
                 echo "| rolled to | \`${ROLLBACK_TAG}\` |"
+                echo "| commit | \`$(git rev-parse HEAD)\` |"
                 echo ""
                 echo "To undo, set ROLLBACK_IMAGE_TAG to the previous tag and re-run."
               } >> "$GITHUB_STEP_SUMMARY"
-          - name: Wait for the application to converge on the rolled-back tag
+          - name: Wait for Argo CD to reconcile the rollback
             run: |
               set -euo pipefail
-              # Prove the rollback took effect rather than reporting success on
-              # a patch that selfHeal may have reverted.
+              # The root Application is PINNED to the SHA the last deploy wrote,
+              # so it will not pick up this new commit on its own. Repoint it at
+              # the rollback commit - the same mechanism the configure stage
+              # uses, which is what makes the pin safe rather than a trap.
+              #
+              # This is the ONE kubectl write this workflow performs, and it is
+              # on the root's targetRevision (a pointer to Git), NOT on an image
+              # tag. The tag itself still comes from the commit.
+              if [ -z "${ROLLBACK_SHA:-}" ]; then
+                echo "no rollback commit was made - nothing to reconcile"
+                exit 0
+              fi
+              aws eks update-kubeconfig --region "$AWS_REGION" \
+                --name "$(cat /tmp/cluster_name)"
+              kubectl -n argocd patch application root --type merge \
+                --patch "{\"spec\":{\"source\":{\"targetRevision\":\"${ROLLBACK_SHA}\"}}}"
+              echo "root repointed to ${ROLLBACK_SHA}"
               DEADLINE=$((SECONDS + 600))
               while true; do
                 TAG="$(kubectl get application "$APP" -n argocd \
@@ -885,13 +995,7 @@ pipelines:
                 SYNC="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)"
                 HEALTH="$(kubectl get application "$APP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo Unknown)"
                 echo "  tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH"
-                if [ "$TAG" != "$ROLLBACK_TAG" ]; then
-                  echo "ERROR: image.tag reverted to '${TAG:-<empty>}'."
-                  echo "The root Application's ignoreDifferences for"
-                  echo "/spec/source/helm/parameters is missing or misattached."
-                  exit 1
-                fi
-                if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                if [ "$TAG" = "$ROLLBACK_TAG" ] && [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
                   echo "rollback complete: ${APP} is Synced and Healthy on ${ROLLBACK_TAG}"
                   break
                 fi
@@ -901,7 +1005,7 @@ pipelines:
                   exit 1
                 fi
                 if [ "$SECONDS" -ge "$DEADLINE" ]; then
-                  echo "timed out (sync=$SYNC health=$HEALTH)"
+                  echo "timed out (tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH)"
                   kubectl get application "$APP" -n argocd -o jsonpath='{.status.conditions}'
                   exit 1
                 fi

@@ -6,7 +6,8 @@ admin: Operator (public - password only) { shape: person; udap-type: generic.use
 dns: cPanel DNS royalbengal.xyz (manual CNAMEs) { udap-type: generic.cdn }
 acm: ACM Cert argocd.rbai.royalbengal.xyz (DNS validation) { udap-type: aws.acm }
 repo: GitHub Repo (app + chart + gitops + infra) { shape: cylinder; udap-type: generic.app }
-ci: GitHub Actions (test - security - image - provision - configure - verify) { udap-type: generic.app }
+values: gitops-apps-values.yaml - DESIRED VERSION per environment { shape: cylinder; udap-type: generic.app }
+ci: GitHub Actions (test - security - provision - image - configure - verify) { udap-type: generic.app }
 rollbackwf: Rollback Workflow (manual dispatch - ROLLBACK_IMAGE_TAG repo var) { udap-type: generic.app }
 ecr: ECR Repository { udap-type: aws.ecr }
 vpc: VPC 10.0.0.0/16 (public + private subnets) {
@@ -24,18 +25,19 @@ vpc: VPC 10.0.0.0/16 (public + private subnets) {
 
 dev -> repo: git push
 repo -> ci: workflow_dispatch (platform trigger)
+repo -> values: contains
 dev -> rollbackwf: dispatch after setting the tag variable
-rollbackwf -> ecr: verify tag exists before patching
-rollbackwf -> vpc.argocd: kubectl patch Application image.tag
+rollbackwf -> ecr: verify tag exists BEFORE writing anything
+rollbackwf -> values: commit the previous tag for one environment
+rollbackwf -> vpc.argocd: repoint root targetRevision to the rollback commit
 ci -> ecr: build and push image tag=commit SHA
+ci -> values: COMMIT the new image tag (write-back)
 ci -> vpc.eks: terraform apply - cluster and node group
 ci -> acm: request cert - output validation CNAME
 dns -> acm: operator adds validation CNAME
-ci -> vpc.argocd: helm install argocd - apply root-app - apply ingress
+ci -> vpc.argocd: helm install argocd - apply root pinned to write-back SHA
 ci -> vpc.rollouts: kubectl apply install manifest (idempotent)
-ci -> vpc.app: kubectl patch Application - image tag parameter
-ci -> vpc.appbg: kubectl patch Application - image tag parameter
-ci -> vpc.appcanary: kubectl patch Application - image tag parameter
+values -> vpc.argocd: desired image tag per environment
 vpc.argocd -> repo: poll gitops/ and chart/ (desired state)
 vpc.argocd -> vpc.app: sync - prune - selfHeal
 vpc.argocd -> vpc.appbg: sync - prune - selfHeal

@@ -1,23 +1,30 @@
 {{- if not .Values.repoURL }}
 {{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
 {{- end }}
+{{- if not .Values.imageRepository }}
+{{- fail "imageRepository is empty in gitops/apps/values.yaml - the image stage writes it from `terraform output -raw ecr_repository_url`" }}
+{{- end }}
+{{- if not .Values.imageTagDev }}
+{{- fail "imageTagDev is empty in gitops/apps/values.yaml - the image stage commits the pushed image tag there" }}
+{{- end }}
 # ---------------------------------------------------------------------------
 # app-dev — the dev instance of the application chart.
 #
 # Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
 # parameter. Nothing here hardcodes an org/repo pair.
 #
-# NOTE the empty helm.parameters list. The configure stage patches
-# image.repository and image.tag onto THIS OBJECT with `kubectl patch`, making
-# the running version CLUSTER state rather than Git state. That is why a deploy
-# never produces a commit, and why selfHeal can stay on permanently.
+# THE IMAGE TAG COMES FROM GIT.
 #
-# The ignoreDifferences that protects those patched parameters lives on the
-# ROOT Application (gitops/root-app.yaml), NOT here. Root is what renders and
-# reconciles this object, so root is what must be told to ignore the drift it
-# would otherwise see. A copy on this Application governs only how app-dev
-# compares its OWN managed resources (Deployment/Service/Ingress) and cannot
-# exempt app-dev from its parent — it silently did nothing and cost a deploy.
+# image.repository and image.tag are rendered from gitops/apps/values.yaml,
+# which the `image` stage rewrites and COMMITS after pushing a new image. Argo
+# CD syncs them because they are the desired state.
+#
+# They used to be written onto this live object with `kubectl patch` while Git
+# declared `parameters: []`. Root reconciles this Application, saw the patch as
+# drift, and selfHeal reverted it — survivable only with an ignoreDifferences
+# exemption on the root, a repo-server cache-bust and an assertion step. On
+# 2026-09-05 the revert won the race here and app-bluegreen deployed nothing.
+# Do not reintroduce that mechanism: if the tag needs to change, commit it.
 # ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -36,7 +43,11 @@ spec:
       releaseName: app-dev
       valueFiles:
         - values.yaml
-      parameters: []
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: image.tag
+          value: {{ .Values.imageTagDev | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: app-dev

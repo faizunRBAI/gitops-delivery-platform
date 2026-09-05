@@ -1,6 +1,12 @@
 {{- if not .Values.repoURL }}
 {{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
 {{- end }}
+{{- if not .Values.imageRepository }}
+{{- fail "imageRepository is empty in gitops/apps/values.yaml - the image stage writes it from `terraform output -raw ecr_repository_url`" }}
+{{- end }}
+{{- if not .Values.imageTagCanary }}
+{{- fail "imageTagCanary is empty in gitops/apps/values.yaml - the image stage commits the pushed image tag there" }}
+{{- end }}
 # ---------------------------------------------------------------------------
 # app-canary — the same application chart, released with an Argo Rollouts
 # canary strategy, in its own namespace.
@@ -8,10 +14,9 @@
 # Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
 # parameter. Nothing here hardcodes an org/repo pair.
 #
-# canary.enabled is set through `helm.values` rather than `parameters` ON
-# PURPOSE: the configure stage's merge patch REPLACES spec.source.helm.parameters
-# wholesale to inject the image tag, so a strategy flag stored there would be
-# silently wiped on the next deploy. `values` is a separate field.
+# THE IMAGE TAG COMES FROM GIT (gitops/apps/values.yaml, key imageTagCanary,
+# written and committed by the `image` stage), so a canary can be rolled back
+# on its own without disturbing app-dev or app-bluegreen.
 #
 # MUTUAL EXCLUSION: blueGreen.enabled stays at its false default here, and the
 # chart's `app.validateStrategy` helper fails the render if both are ever on.
@@ -40,7 +45,11 @@ spec:
           enabled: true
         ingress:
           enabled: false
-      parameters: []
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: image.tag
+          value: {{ .Values.imageTagCanary | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: app-canary
@@ -56,9 +65,11 @@ spec:
         duration: 15s
         factor: 2
         maxDuration: 3m
-  # A canary rollout deliberately runs a MIX of replica counts as it steps
-  # through its weights. Argo CD would read each intermediate state as drift and
-  # selfHeal would reset it, collapsing the canary before its pause elapsed.
+  # KEEP THIS. A canary deliberately runs a MIX of replica counts as it steps
+  # through its weights; Argo CD would read each intermediate state as drift and
+  # selfHeal would collapse the canary before its pause elapsed. This exempts
+  # the ROLLOUTS CONTROLLER's own writes — unrelated to the removed parameters
+  # exemption, which existed only to hide CI writing to the cluster.
   ignoreDifferences:
     - group: argoproj.io
       kind: Rollout

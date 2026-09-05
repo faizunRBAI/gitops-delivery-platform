@@ -25,6 +25,7 @@ reconciled into the cluster by Argo CD.
 | `chart/gitops-delivery-platform/` | The Helm chart Argo CD renders — Deployment **or** Rollout, see [Delivery strategies](#delivery-strategies) |
 | `gitops/root-app.yaml` | The app-of-apps root Application |
 | `gitops/apps/` | Child Applications, rendered as a chart (`app-dev`, `app-bluegreen`, `app-canary`) |
+| `gitops/apps/values.yaml` | **The deployed version of every environment** — written by CI, read by Argo |
 | `.trivyignore.yaml` | Scoped, justified, **expiring** security exceptions |
 | `.udap/architecture.d2` | Architecture source of truth |
 | `.udap/pipeline.yaml` | Pipeline spec — CI workflows are **rendered** from this |
@@ -37,25 +38,75 @@ hand; edit the spec and let it re-render.
 
 ## The three GitOps rules this repo is built on
 
-**1. Argo CD is the sole writer of workload state.**
-Argo reads `gitops/` and `chart/`. The pipeline *never* writes to either path.
-That single-writer property — not the folder layout — is what makes
-`automated: {prune: true, selfHeal: true}` safe to run from day one. Two writers
-(CI running `kubectl apply` *and* Argo reconciling) would fight forever.
+**1. Argo CD is the sole writer of cluster state.**
+Argo reads `gitops/` and `chart/` and applies them. CI writes to **Git**, never
+to the cluster. That single-writer property — not the folder layout — is what
+makes `automated: {prune: true, selfHeal: true}` safe to run permanently. Two
+writers (CI patching objects *and* Argo reconciling them) fight forever, and
+this repository has the scar tissue to prove it: see
+[Why the image tag lives in Git](#why-the-image-tag-lives-in-git).
 
-**2. The image tag is cluster state, not Git state.**
-CI pushes `…/gitops-delivery-platform:<commit-sha>` to ECR, then patches
-`spec.source.helm.parameters` on each Application with `kubectl patch`. The
-repository is left byte-identical by a deploy, so self-heal has nothing to
-revert. `chart/…/values.yaml` therefore keeps `image.tag: ""` **permanently** —
-the chart's `app.image` helper fails the render if it is ever empty at sync
-time, which turns "someone forgot to patch" into a loud error instead of a pod
-pulling `repository:`.
+**2. The image tag is Git state.**
+CI pushes `…/gitops-delivery-platform:<commit-sha>` to ECR, then **commits** the
+tag into `gitops/apps/values.yaml`. Argo deploys it because it is the desired
+state — not because anything reached into the cluster. A deploy therefore
+produces exactly one extra commit, and `git log gitops/apps/values.yaml` is a
+complete, auditable history of what has run in each environment.
 
 **3. No path filters, no `[skip ci]`.**
 Conventional monorepo GitOps needs those guards because a CI commit retriggers
 CI. UDAP renders `workflow_dispatch`-only workflows triggered by the platform,
 so no commit can retrigger anything. The guards would be cargo cult here.
+
+---
+
+## Why the image tag lives in Git
+
+This is the most important design decision in the repository, and it was
+originally made the other way round. The history is worth keeping.
+
+**The old design.** The `configure` stage patched
+`spec.source.helm.parameters` onto each live Application with `kubectl patch`,
+while `gitops/apps/templates/*.yaml` declared `parameters: []`. The running
+version was cluster state; Git said nothing about it.
+
+That means the cluster and Git **disagreed by construction**, and the root
+Application's `selfHeal` existed to correct exactly that kind of disagreement.
+Keeping the patch alive required three separate workarounds:
+
+- `ignoreDifferences` on the root for `/spec/source/helm/parameters`, so
+  self-heal would not revert CI's patch;
+- a `argocd-repo-server` restart, because the first render (with an empty tag)
+  failed and Argo **cached the failure**;
+- an assertion step to detect the revert when the exemption was misattached.
+
+On 2026-09-05 it failed anyway: `app-dev` and `app-canary` kept their patch,
+`app-bluegreen` lost it and deployed nothing. Same exemption, same deploy,
+different outcome — which is the signature of a **race**, not a missing
+exemption. Three workarounds were holding up an inverted design.
+
+**The current design.** `gitops/apps/values.yaml` holds the ECR repository and a
+tag per environment. The `image` stage rewrites that file after pushing and
+commits it; the root Application is pinned to that commit; each child renders
+`image.repository` / `image.tag` from those values.
+
+All three workarounds are **gone**. There is no `ignoreDifferences` on
+parameters, no cache-bust restart, and no assertion — because nothing writes
+cluster state that Git also owns, so there is no drift to exempt, no failed
+first render to cache, and nothing to revert.
+
+> **If you ever find yourself adding `ignoreDifferences` for
+> `/spec/source/helm/parameters` again, stop.** Its presence means something has
+> started writing cluster state that Git also declares. Fix the writer.
+
+**Why the root Application is pinned to a commit SHA.** The `configure` job
+checked out the commit that *triggered* the run — which is the **parent** of the
+write-back commit the `image` stage just created. Pointing root at `main` would
+work only if Argo happened to poll after the push, making convergence dependent
+on timing. The `image` stage exports the write-back SHA as a job output and
+`configure` pins `targetRevision` to it, so the deploy is deterministic. (A git
+SHA is safe as a job output: it contains no secret substring, unlike the ECR URL
+which embeds `PROJECT_NAME`.)
 
 ---
 
@@ -75,12 +126,6 @@ workload template calls the `app.validateStrategy` helper, which `fail`s the
 render if both flags are on. The plain `Deployment` is guarded by
 `{{- if and (not .Values.blueGreen.enabled) (not .Values.canary.enabled) }}`, so
 a Rollout and a Deployment can never both own the same pods.
-
-**Why the strategy flags live in `helm.values` and not `helm.parameters`:** the
-configure stage patches `spec.source.helm.parameters` with a **merge** patch to
-inject the image tag, and a merge patch *replaces* a list wholesale. Anything
-stored in `parameters` would be silently wiped on the next deploy. `values` is a
-separate field the patch never touches.
 
 ### Blue/green
 
@@ -110,6 +155,11 @@ Both Rollout Applications ignore `/spec/replicas` — the controller owns the
 replica count during a release, and without that exemption self-heal would reset
 each intermediate state and collapse the canary before its pause elapsed.
 
+> These `ignoreDifferences` are **legitimate** and unrelated to the removed
+> parameters exemption. They exempt the *Rollouts controller's* own writes,
+> which no other actor duplicates. The removed one existed to hide CI writing
+> to the cluster.
+
 Neither progressive-delivery instance renders an Ingress (`ingress.enabled:
 false`): each one would provision its own billable ALB. They are exercised
 in-cluster.
@@ -125,15 +175,33 @@ in-cluster.
 | `test` | `mvn verify` — unit + MockMvc tests |
 | `security` | Trivy scan of the tree: vuln + secret + misconfig, HIGH/CRITICAL fail the build |
 | `provision` | `terraform init -reconfigure` + `apply` over `infra/` — creates the VPC, EKS cluster, **and the ECR repository** |
-| `image` | Reads the registry URL from terraform state, builds the jar and image, pushes tagged with the commit SHA |
-| `configure` | Argo CD install, **Argo Rollouts install**, ALB controller, anonymous-read check, root app, image-tag patch on all three Applications, repo-server cache refresh |
+| `image` | Reads the registry URL from state, builds and pushes the image, then **commits the new tag to `gitops/apps/values.yaml`** |
+| `configure` | Argo CD install, **Argo Rollouts install**, ALB controller, anonymous-read check, root app pinned to the write-back commit, then waits for all three Applications to report that tag |
 | `verify` | Polls all four Applications for `Synced` + `Healthy`, checks both Rollouts reached a stable phase, then curls the ALB |
 
 **Every stage that needs an infrastructure value reads it itself** by re-running
 `terraform init` with identical `-backend-config` flags and calling
-`terraform output -raw`. Nothing is threaded between jobs: GitHub silently drops
-job outputs containing a secret substring, and `PROJECT_NAME` is a secret that
-appears inside every resource name here.
+`terraform output -raw`. Endpoint and registry values are never threaded between
+jobs: GitHub silently drops job outputs containing a secret substring, and
+`PROJECT_NAME` is a secret that appears inside every resource name here. The one
+exception is the write-back commit SHA, which contains no secret substring.
+
+### ⚠️ Required repository setting
+
+The `image` stage **pushes a commit**. That needs `GITHUB_TOKEN` to have write
+access to contents:
+
+```
+Settings → Actions → General → Workflow permissions
+  → Read and write permissions
+```
+
+The pipeline spec has no field for a workflow `permissions:` block, so this
+cannot be set from the repository's own configuration — it is an account/repo
+setting. If a deploy fails at *"Write the new image tag into
+gitops/apps/values.yaml and commit"* with a `403` on `git push`, this is why.
+Branch protection requiring pull requests on `main` would block it for the same
+reason; the write-back needs direct push.
 
 ### Why the Rollouts controller installs before the root Application
 
@@ -148,20 +216,6 @@ release manifest rather than Helm: the CRDs exceed the 262144-byte annotation
 limit that client-side apply imposes, so `--server-side` is required, not merely
 preferred. `--force-conflicts` lets an upgrade take ownership of fields an
 earlier client-side apply wrote.
-
-### The repo-server cache refresh
-
-On a **fresh** cluster the root Application creates each child with an empty
-`parameters: []`. Argo renders it immediately, the chart's image guard fails,
-and the repo-server **caches that failure**. The image-tag patch then lands, but
-Argo keeps serving the stale error once its retry backoff is spent — the
-Application sits at `sync=Unknown` with a `ComparisonError` reading `(cached)`.
-
-That state was previously cleared by hand. The configure stage now restarts
-`argocd-repo-server` after patching and requests a hard refresh, making the fix
-part of the deploy instead of tribal knowledge. A hard-refresh annotation alone
-is *not* sufficient — it re-renders but can still be served from the failed-render
-cache.
 
 ### Why provision runs before image
 
@@ -222,8 +276,8 @@ These are two Trivy views of **one** structural fact: the `configure` stage
 drives `helm` and `kubectl` from a GitHub-hosted runner, which sits outside the
 VPC and draws from Azure's public IP ranges with no stable egress address. No
 CIDR narrower than `0.0.0.0/0` lets the deploy reach the API server, and turning
-the public endpoint off makes the pipeline unrunnable. Both close together in
-Phase 2 via a self-hosted runner inside the VPC.
+the public endpoint off makes the pipeline unrunnable. Both close together via a
+self-hosted runner inside the VPC.
 
 Mitigations in place today: private endpoint access enabled so in-VPC traffic
 never leaves the network; IAM authentication in API mode, so *reachability is
@@ -295,6 +349,7 @@ restore the repository-credential step in the configure stage.
 |---|---|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Set by the platform |
 | `TF_STATE_BUCKET`, `PROJECT_NAME` | Set by the platform |
+| `GITHUB_TOKEN` | Built-in — used by the `image` and `rollback` stages to push the version commit |
 | `ARGOCD_ALLOWED_CIDRS` | Operator — HCL list syntax, consumed by Terraform *and* the ingress annotation |
 | `ARGOCD_ADMIN_PASSWORD` | Operator — alphanumeric, 20+ chars (it passes through `htpasswd` and a JSON patch body) |
 
@@ -324,13 +379,19 @@ Settings → Secrets and variables → Actions → Variables
 Actions → rollback → Run workflow
 ```
 
-It reads the registry URL from Terraform state, **confirms the tag exists in
-ECR before touching the cluster** (patching to a tag that was never pushed would
-produce `ImagePullBackOff` on every new pod — a broken deployment created *by*
-the rollback), patches the Application, and then waits for it to actually
-converge on the requested tag rather than reporting success on a patch that
-self-heal may have reverted. The run summary records the previous tag so undoing
-the rollback is one variable change away.
+**A rollback is a commit.** It confirms the tag exists in ECR *before writing
+anything* (rolling to a tag that was never pushed would produce
+`ImagePullBackOff` on every new pod — a broken deployment created *by* the
+rollback), rewrites that environment's key in `gitops/apps/values.yaml`, pushes,
+repoints the root Application at the new commit, and waits for convergence.
+
+Because each environment has its own key (`imageTagDev`, `imageTagBluegreen`,
+`imageTagCanary`), rolling one back does not disturb the other two.
+
+> **Why a commit rather than a `kubectl patch`?** A patched rollback leaves Git
+> still naming the broken version, so the next deploy — or any self-heal pass —
+> quietly rolls forward onto the exact image you just backed away from. The
+> commit is the rollback; the cluster follows.
 
 > **Why a repository variable and not a `workflow_dispatch` input?** The platform
 > renders every workflow with a bare `workflow_dispatch: {}` and the pipeline
@@ -341,18 +402,20 @@ the rollback is one variable change away.
 > old tag and waits for promotion, because `autoPromotionEnabled` is false.
 > Promote it to move traffic.
 
-**2. `argocd app rollback <app> <id>`** — reverts to a previous sync revision.
+**2. Edit `gitops/apps/values.yaml` by hand and commit.** The workflow is a
+convenience wrapper around exactly this. Argo picks it up on its next reconcile
+if root tracks a branch; repoint `targetRevision` if it is pinned.
 
-**3. Revert the commit** — for chart or manifest changes, since those *are* Git
-state. Argo picks the revert up on its next reconcile.
+**3. `argocd app rollback <app> <id>`** — reverts to a previous sync revision.
+Note this diverges from Git until you also commit, so prefer 1 or 2.
 
 **4. `terraform` revert + apply** — infrastructure has no undo; roll the commit
 back and re-run `provision`.
 
 The pipeline declares `rollback: {strategy: manual}`: nothing rolls back
-automatically, because on a GitOps cluster an automatic CI rollback would be a
-second writer racing Argo. The `rollback` workflow is manual dispatch for the
-same reason — a human decides, the workflow executes.
+automatically, because an automatic CI rollback would be a second writer racing
+Argo. The `rollback` workflow is manual dispatch for the same reason — a human
+decides, the workflow executes.
 
 ---
 
@@ -372,6 +435,7 @@ the rendered destroy workflow with the same backend and credentials.
 | 3 | ALB traffic router so canary weights shift **requests**, not pod proportions |
 | 3 | Observability: Prometheus, Grafana, Argo CD notifications, Rollouts label-sync |
 | 4 | Flux under `flux/` as a second reconciler for comparison |
+| — | **Argo CD Image Updater** — writes the tag back to Git itself, removing CI's need for `contents: write` |
 | — | **SSO/OIDC for Argo CD with `admin.enabled: false`** — the correct fix for the open console |
 | — | **Self-hosted runner inside the VPC** → narrow `cluster_public_access_cidrs`, disable the public endpoint, drop both `.trivyignore.yaml` entries |
 | — | **Scheduled OWASP Dependency-Check** with a cached NVD directory, off the critical path (removed from `security` on 2026-09-05 for runtime) |

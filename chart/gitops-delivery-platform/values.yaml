@@ -14,11 +14,17 @@
 replicaCount: 2
 
 image:
-  # repository is patched onto the Argo CD Application by the configure stage
-  # (the ECR URL comes from `terraform output -raw ecr_repository_url`).
+  # BOTH HALVES ARRIVE AS ARGO CD HELM PARAMETERS, rendered by the child
+  # Application from gitops/apps/values.yaml — which the `image` stage rewrites
+  # and COMMITS after pushing a new image. The running version is therefore Git
+  # state, reconciled by Argo CD, not something CI writes to the cluster.
+  #
+  # They stay EMPTY here on purpose. This chart is deployed for three different
+  # environments with three different tags, so there is no correct default —
+  # and an empty value is what makes the `app.image` helper fail loudly instead
+  # of rendering `image: repo:` if the plumbing ever breaks. Committing a real
+  # tag here would silently shadow that guard for every environment at once.
   repository: ""
-  # NEVER commit a real tag here. Argo CD receives it as a Helm parameter, so a
-  # deploy leaves this repository untouched and selfHeal has nothing to fight.
   tag: ""
   pullPolicy: Always
 

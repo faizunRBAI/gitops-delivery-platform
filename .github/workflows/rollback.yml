@@ -14,6 +14,7 @@ jobs:
       TF_VAR_aws_region: us-east-1
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+      GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       ROLLBACK_APP: ${{ vars.ROLLBACK_APPLICATION }}
       ROLLBACK_TAG: ${{ vars.ROLLBACK_IMAGE_TAG }}
     timeout-minutes: 20
@@ -36,78 +37,97 @@ jobs:
         \   = <the commit SHA to roll back to>\"\n  echo \"  ROLLBACK_APPLICATION\
         \ = app-dev | app-bluegreen | app-canary\"\n  echo \"                    \
         \     (optional, defaults to app-dev)\"\n  echo\n  echo \"Then run this workflow\
-        \ again.\"\n  exit 1\nfi\ncase \"$APP\" in\n  app-dev|app-bluegreen|app-canary)\
-        \ ;;\n  *)\n    echo \"ERROR: ROLLBACK_APPLICATION must be one of\"\n    echo\
-        \ \"  app-dev, app-bluegreen, app-canary\"\n    echo \"Got: '${APP}'\"\n \
-        \   exit 1\n    ;;\nesac\necho \"APP=${APP}\" >> \"$GITHUB_ENV\"\necho \"\
-        rollback target: ${APP} -> ${ROLLBACK_TAG}\"\n"
+        \ again.\"\n  exit 1\nfi\n# Map the application to the values.yaml key holding\
+        \ its tag.\ncase \"$APP\" in\n  app-dev)       KEY=\"imageTagDev\" ;;\n  app-bluegreen)\
+        \ KEY=\"imageTagBluegreen\" ;;\n  app-canary)    KEY=\"imageTagCanary\" ;;\n\
+        \  *)\n    echo \"ERROR: ROLLBACK_APPLICATION must be one of\"\n    echo \"\
+        \  app-dev, app-bluegreen, app-canary\"\n    echo \"Got: '${APP}'\"\n    exit\
+        \ 1\n    ;;\nesac\necho \"APP=${APP}\" >> \"$GITHUB_ENV\"\necho \"TAG_KEY=${KEY}\"\
+        \ >> \"$GITHUB_ENV\"\necho \"rollback target: ${APP} (${KEY}) -> ${ROLLBACK_TAG}\"\
+        \n"
     - name: Read infrastructure outputs from terraform state
       run: "set -euo pipefail\n# Self-sufficient job (this workflow has no provision\
         \ stage to\n# inherit from): same backend flags, read what we need from state.\n\
         terraform init -input=false -reconfigure \\\n  -backend-config=\"bucket=${{\
         \ secrets.TF_STATE_BUCKET }}\" \\\n  -backend-config=\"key=${{ secrets.PROJECT_NAME\
         \ }}/terraform.tfstate\" \\\n  -backend-config=\"region=us-east-1\"\nterraform\
-        \ output -raw cluster_name > /tmp/cluster_name\nterraform output -raw ecr_repository_url\
-        \ > /tmp/ecr_url\n"
+        \ output -raw cluster_name > /tmp/cluster_name\n"
       working-directory: infra
     - name: Confirm the requested tag exists in ECR
-      run: "set -euo pipefail\n# FAIL BEFORE TOUCHING THE CLUSTER. Patching an Application\
-        \ to a\n# tag that was never pushed produces ImagePullBackOff on every new\n\
-        # pod - a broken deployment created BY the rollback that was meant\n# to fix\
-        \ one. Checking ECR first turns that into a clean refusal.\nif ! aws ecr describe-images\
-        \ --region \"$AWS_REGION\" \\\n       --repository-name \"$PROJECT_NAME\"\
-        \ \\\n       --image-ids imageTag=\"$ROLLBACK_TAG\" >/dev/null 2>&1; then\n\
-        \  echo \"ERROR: no image tagged '${ROLLBACK_TAG}' exists in ECR.\"\n  echo\
-        \ \"Recently pushed tags (oldest to newest):\"\n  aws ecr describe-images\
-        \ --region \"$AWS_REGION\" \\\n    --repository-name \"$PROJECT_NAME\" \\\n\
-        \    --query 'sort_by(imageDetails,&imagePushedAt)[-20:].imageTags[0]' \\\n\
-        \    --output text\n  exit 1\nfi\necho \"OK: ${ROLLBACK_TAG} exists in ECR\"\
-        \n"
-    - name: Update kubeconfig
-      run: 'set -euo pipefail
-
-        aws eks update-kubeconfig --region "$AWS_REGION" --name "$(cat /tmp/cluster_name)"
-
-        kubectl cluster-info
-
-        '
-    - name: Patch the Application back to the requested tag
-      run: "set -euo pipefail\nECR_URL=\"$(cat /tmp/ecr_url)\"\n# Record what we are\
-        \ moving away from, so the log alone is enough\n# to undo the rollback.\n\
-        PREVIOUS=\"$(kubectl get application \"$APP\" -n argocd \\\n  -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"\
-        image.tag\")].value}' 2>/dev/null || true)\"\necho \"rolling ${APP}: ${PREVIOUS:-<unset>}\
-        \ -> ${ROLLBACK_TAG}\"\n# BOTH parameters again - a merge patch replaces the\
-        \ whole list,\n# so omitting image.repository would blank it and fail the\
-        \ render.\nkubectl patch application \"$APP\" --namespace argocd --type merge\
-        \ \\\n  --patch \"{\\\"spec\\\":{\\\"source\\\":{\\\"helm\\\":{\\\"parameters\\\
-        \":[{\\\"name\\\":\\\"image.repository\\\",\\\"value\\\":\\\"${ECR_URL}\\\"\
-        },{\\\"name\\\":\\\"image.tag\\\",\\\"value\\\":\\\"${ROLLBACK_TAG}\\\"}]}}}}\"\
-        \n{\n  echo \"### Rollback\"\n  echo \"\"\n  echo \"| field | value |\"\n\
-        \  echo \"| --- | --- |\"\n  echo \"| application | \\`${APP}\\` |\"\n  echo\
+      run: "set -euo pipefail\n# FAIL BEFORE COMMITTING ANYTHING. Rolling the repository\
+        \ to a tag\n# that was never pushed produces ImagePullBackOff on every new\
+        \ pod\n# - a broken deployment created BY the rollback that was meant to\n\
+        # fix one. Checking ECR first turns that into a clean refusal with\n# nothing\
+        \ written to Git.\nif ! aws ecr describe-images --region \"$AWS_REGION\" \\\
+        \n       --repository-name \"$PROJECT_NAME\" \\\n       --image-ids imageTag=\"\
+        $ROLLBACK_TAG\" >/dev/null 2>&1; then\n  echo \"ERROR: no image tagged '${ROLLBACK_TAG}'\
+        \ exists in ECR.\"\n  echo \"Recently pushed tags (oldest to newest):\"\n\
+        \  aws ecr describe-images --region \"$AWS_REGION\" \\\n    --repository-name\
+        \ \"$PROJECT_NAME\" \\\n    --query 'sort_by(imageDetails,&imagePushedAt)[-20:].imageTags[0]'\
+        \ \\\n    --output text\n  exit 1\nfi\necho \"OK: ${ROLLBACK_TAG} exists in\
+        \ ECR\"\n"
+    - name: Commit the rollback to gitops/apps/values.yaml
+      run: "set -euo pipefail\n# A ROLLBACK IS A COMMIT, not a patch against the cluster.\n\
+        #\n# This used to `kubectl patch` the live Application, which left\n# Git\
+        \ still naming the broken version: the next deploy - or any\n# selfHeal pass\
+        \ - would quietly roll forward again onto the exact\n# image the operator\
+        \ had just backed away from. Writing the old\n# tag to Git makes the rollback\
+        \ durable and auditable, and Argo CD\n# applies it the same way it applies\
+        \ every other change.\nPREVIOUS=\"$(grep -E \"^${TAG_KEY}:\" gitops/apps/values.yaml\
+        \ \\\n  | sed -E 's/^[^:]+:[[:space:]]*\"?([^\"]*)\"?[[:space:]]*$/\\1/')\"\
+        \necho \"rolling ${APP}: ${PREVIOUS:-<unset>} -> ${ROLLBACK_TAG}\"\nif [ \"\
+        $PREVIOUS\" = \"$ROLLBACK_TAG\" ]; then\n  echo \"${APP} already names ${ROLLBACK_TAG}\
+        \ - nothing to roll back.\"\n  exit 0\nfi\n# Rewrite only this environment's\
+        \ key, leaving the other two\n# untouched. python rather than sed: the replacement\
+        \ is inserted\n# literally, and sed's & and / are landmines here (pitfall\
+        \ #11).\npython3 - \"$TAG_KEY\" \"$ROLLBACK_TAG\" <<'PY'\nimport re, sys\n\
+        key, tag = sys.argv[1], sys.argv[2]\npath = \"gitops/apps/values.yaml\"\n\
+        src = open(path).read()\nnew, n = re.subn(rf'^{re.escape(key)}:.*$', f'{key}:\
+        \ \"{tag}\"',\n                 src, count=1, flags=re.M)\nif n != 1:\n  \
+        \  sys.exit(f\"ERROR: key {key} not found in {path}\")\nopen(path, \"w\").write(new)\n\
+        print(f\"set {key} to {tag}\")\nPY\ngit config user.name \"github-actions[bot]\"\
+        \ngit config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"\
+        \ngit add gitops/apps/values.yaml\ngit commit -m \"rollback: ${APP} to ${ROLLBACK_TAG}\
+        \ (was ${PREVIOUS:-unset})\"\ngit pull --rebase origin \"${GITHUB_REF_NAME}\"\
+        \ngit push origin \"HEAD:${GITHUB_REF_NAME}\"\necho \"ROLLBACK_SHA=$(git rev-parse\
+        \ HEAD)\" >> \"$GITHUB_ENV\"\n{\n  echo \"### Rollback\"\n  echo \"\"\n  echo\
+        \ \"| field | value |\"\n  echo \"| --- | --- |\"\n  echo \"| application\
+        \ | \\`${APP}\\` |\"\n  echo \"| values key | \\`${TAG_KEY}\\` |\"\n  echo\
         \ \"| previous tag | \\`${PREVIOUS:-<unset>}\\` |\"\n  echo \"| rolled to\
-        \ | \\`${ROLLBACK_TAG}\\` |\"\n  echo \"\"\n  echo \"To undo, set ROLLBACK_IMAGE_TAG\
-        \ to the previous tag and re-run.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
-    - name: Wait for the application to converge on the rolled-back tag
-      run: "set -euo pipefail\n# Prove the rollback took effect rather than reporting\
-        \ success on\n# a patch that selfHeal may have reverted.\nDEADLINE=$((SECONDS\
-        \ + 600))\nwhile true; do\n  TAG=\"$(kubectl get application \"$APP\" -n argocd\
-        \ \\\n    -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\"\
-        )].value}' 2>/dev/null || true)\"\n  SYNC=\"$(kubectl get application \"$APP\"\
-        \ -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)\"\
-        \n  HEALTH=\"$(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.health.status}'\
+        \ | \\`${ROLLBACK_TAG}\\` |\"\n  echo \"| commit | \\`$(git rev-parse HEAD)\\\
+        ` |\"\n  echo \"\"\n  echo \"To undo, set ROLLBACK_IMAGE_TAG to the previous\
+        \ tag and re-run.\"\n} >> \"$GITHUB_STEP_SUMMARY\"\n"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Wait for Argo CD to reconcile the rollback
+      run: "set -euo pipefail\n# The root Application is PINNED to the SHA the last\
+        \ deploy wrote,\n# so it will not pick up this new commit on its own. Repoint\
+        \ it at\n# the rollback commit - the same mechanism the configure stage\n\
+        # uses, which is what makes the pin safe rather than a trap.\n#\n# This is\
+        \ the ONE kubectl write this workflow performs, and it is\n# on the root's\
+        \ targetRevision (a pointer to Git), NOT on an image\n# tag. The tag itself\
+        \ still comes from the commit.\nif [ -z \"${ROLLBACK_SHA:-}\" ]; then\n  echo\
+        \ \"no rollback commit was made - nothing to reconcile\"\n  exit 0\nfi\naws\
+        \ eks update-kubeconfig --region \"$AWS_REGION\" \\\n  --name \"$(cat /tmp/cluster_name)\"\
+        \nkubectl -n argocd patch application root --type merge \\\n  --patch \"{\\\
+        \"spec\\\":{\\\"source\\\":{\\\"targetRevision\\\":\\\"${ROLLBACK_SHA}\\\"\
+        }}}\"\necho \"root repointed to ${ROLLBACK_SHA}\"\nDEADLINE=$((SECONDS + 600))\n\
+        while true; do\n  TAG=\"$(kubectl get application \"$APP\" -n argocd \\\n\
+        \    -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\")].value}'\
+        \ 2>/dev/null || true)\"\n  SYNC=\"$(kubectl get application \"$APP\" -n argocd\
+        \ -o jsonpath='{.status.sync.status}' 2>/dev/null || echo Unknown)\"\n  HEALTH=\"\
+        $(kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.health.status}'\
         \ 2>/dev/null || echo Unknown)\"\n  echo \"  tag=${TAG:-<empty>} sync=$SYNC\
-        \ health=$HEALTH\"\n  if [ \"$TAG\" != \"$ROLLBACK_TAG\" ]; then\n    echo\
-        \ \"ERROR: image.tag reverted to '${TAG:-<empty>}'.\"\n    echo \"The root\
-        \ Application's ignoreDifferences for\"\n    echo \"/spec/source/helm/parameters\
-        \ is missing or misattached.\"\n    exit 1\n  fi\n  if [ \"$SYNC\" = \"Synced\"\
-        \ ] && [ \"$HEALTH\" = \"Healthy\" ]; then\n    echo \"rollback complete:\
-        \ ${APP} is Synced and Healthy on ${ROLLBACK_TAG}\"\n    break\n  fi\n  if\
-        \ [ \"$HEALTH\" = \"Degraded\" ]; then\n    echo \"ERROR: ${APP} is Degraded\
-        \ after the rollback.\"\n    kubectl describe application \"$APP\" -n argocd\n\
-        \    exit 1\n  fi\n  if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n    echo\
-        \ \"timed out (sync=$SYNC health=$HEALTH)\"\n    kubectl get application \"\
-        $APP\" -n argocd -o jsonpath='{.status.conditions}'\n    exit 1\n  fi\n  sleep\
-        \ 15\ndone\necho\necho \"NOTE for app-bluegreen: a rollback creates a new\
-        \ PREVIEW\"\necho \"ReplicaSet on the old tag and waits for promotion, because\"\
-        \necho \"autoPromotionEnabled is false. Promote it to take traffic:\"\necho\
-        \ \"  kubectl argo rollouts promote <rollout> -n app-bluegreen\"\n"
+        \ health=$HEALTH\"\n  if [ \"$TAG\" = \"$ROLLBACK_TAG\" ] && [ \"$SYNC\" =\
+        \ \"Synced\" ] && [ \"$HEALTH\" = \"Healthy\" ]; then\n    echo \"rollback\
+        \ complete: ${APP} is Synced and Healthy on ${ROLLBACK_TAG}\"\n    break\n\
+        \  fi\n  if [ \"$HEALTH\" = \"Degraded\" ]; then\n    echo \"ERROR: ${APP}\
+        \ is Degraded after the rollback.\"\n    kubectl describe application \"$APP\"\
+        \ -n argocd\n    exit 1\n  fi\n  if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n\
+        \    echo \"timed out (tag=${TAG:-<empty>} sync=$SYNC health=$HEALTH)\"\n\
+        \    kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n\
+        \    exit 1\n  fi\n  sleep 15\ndone\necho\necho \"NOTE for app-bluegreen:\
+        \ a rollback creates a new PREVIEW\"\necho \"ReplicaSet on the old tag and\
+        \ waits for promotion, because\"\necho \"autoPromotionEnabled is false. Promote\
+        \ it to take traffic:\"\necho \"  kubectl argo rollouts promote <rollout>\
+        \ -n app-bluegreen\"\n"

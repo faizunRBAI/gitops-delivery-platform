@@ -119,6 +119,8 @@ jobs:
       TF_VAR_argocd_allowed_cidrs: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
     timeout-minutes: 30
+    outputs:
+      gitops_sha: ${{ steps.writeback.outputs.gitops_sha }}
     steps:
     - uses: actions/checkout@v4
     - name: Set up JDK 21
@@ -158,6 +160,45 @@ jobs:
         \ \"image for $GITHUB_SHA already present in ECR - skipping build and push\"\
         \n  exit 0\nfi\ndocker build -t \"$IMAGE\" app\ndocker push \"$IMAGE\"\necho\
         \ \"pushed image for $GITHUB_SHA\"\n"
+    - id: writeback
+      name: Write the new image tag into gitops/apps/values.yaml and commit
+      run: "set -euo pipefail\nECR_URL=\"$(cat /tmp/ecr_url)\"\n# REWRITTEN WHOLESALE\
+        \ WITH A HEREDOC, not edited in place with sed.\n# The ECR URL contains slashes\
+        \ and dots; a sed s/// expression over it\n# is a delimiter bug waiting to\
+        \ happen (known pitfall #11). The file is\n# small and fully owned by this\
+        \ stage, so emitting it entire is both\n# safer and easier to read in a diff.\n\
+        #\n# The delimiter is UNQUOTED so ${ECR_URL} and ${GITHUB_SHA} expand;\n#\
+        \ every literal $ and backtick in the body is therefore escaped.\ncat > gitops/apps/values.yaml\
+        \ <<EOF\n# ---------------------------------------------------------------------------\n\
+        # APP-OF-APPS VALUES \u2014 the DESIRED STATE of every environment.\n#\n#\
+        \ GENERATED AND COMMITTED BY CI (the image stage, and the rollback\n# workflow).\
+        \ Edit by hand only to pin or roll a version deliberately \u2014\n# Argo CD\
+        \ reconciles whatever is committed here.\n#\n# The image tag lives in GIT,\
+        \ not in a kubectl patch against the live\n# Applications. That is what lets\
+        \ root's selfHeal stay on permanently:\n# cluster state and Git state agree,\
+        \ so there is nothing to fight and\n# no ignoreDifferences exemption hiding\
+        \ a disagreement.\n# ---------------------------------------------------------------------------\n\
+        repoURL: \"\"\n\ntargetRevision: main\nchartPath: chart/gitops-delivery-platform\n\
+        \n# The ECR repository, from: terraform output -raw ecr_repository_url\nimageRepository:\
+        \ \"${ECR_URL}\"\n\n# PER-ENVIRONMENT IMAGE TAGS (commit SHAs). Separate keys\
+        \ so a rollback\n# can move ONE environment back without dragging the others\
+        \ with it.\nimageTagDev: \"${GITHUB_SHA}\"\nimageTagBluegreen: \"${GITHUB_SHA}\"\
+        \nimageTagCanary: \"${GITHUB_SHA}\"\nEOF\ngit config user.name \"github-actions[bot]\"\
+        \ngit config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"\
+        \n# IDEMPOTENT. Re-running the pipeline on the SAME commit produces an\n#\
+        \ identical file; `git commit` with nothing staged exits non-zero and\n# would\
+        \ fail the job. Detect that and reuse the current HEAD instead.\nif git diff\
+        \ --quiet -- gitops/apps/values.yaml; then\n  echo \"gitops/apps/values.yaml\
+        \ already names ${GITHUB_SHA} - no commit needed\"\n  GITOPS_SHA=\"$(git rev-parse\
+        \ HEAD)\"\nelse\n  git add gitops/apps/values.yaml\n  git commit -m \"deploy:\
+        \ set image tag to ${GITHUB_SHA}\"\n  # Rebase onto any concurrent commit\
+        \ rather than force-pushing over\n  # it. Deploys are workflow_dispatch-only\
+        \ and single-writer, so this\n  # is belt and braces, not an expected path.\n\
+        \  git pull --rebase origin \"${GITHUB_REF_NAME}\"\n  git push origin \"HEAD:${GITHUB_REF_NAME}\"\
+        \n  GITOPS_SHA=\"$(git rev-parse HEAD)\"\n  echo \"committed ${GITOPS_SHA}\"\
+        \nfi\necho \"gitops_sha=${GITOPS_SHA}\" >> \"$GITHUB_OUTPUT\"\n"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   configure:
     runs-on: ubuntu-latest
     needs:
@@ -174,6 +215,7 @@ jobs:
       GITOPS_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       ARGOCD_ALLOWED_CIDRS: ${{ secrets.ARGOCD_ALLOWED_CIDRS }}
       ARGOCD_ADMIN_PASSWORD: ${{ secrets.ARGOCD_ADMIN_PASSWORD }}
+      GITOPS_TARGET_REVISION: ${{ needs.image.outputs.gitops_sha }}
       ARGO_ROLLOUTS_VERSION: v1.7.2
     timeout-minutes: 45
     steps:
@@ -336,72 +378,48 @@ jobs:
         \  echo \"GITOPS_PAT secret and restore the repository-credential step.\"\n\
         \  exit 1\nfi\necho \"OK: repository is anonymously readable\"\n"
     - name: Apply app-of-apps root Application
-      run: 'set -euo pipefail
-
-        export GITOPS_REPO_URL
-
-        envsubst < gitops/root-app.yaml | kubectl apply -f -
-
-        '
-    - name: Patch the image tag onto every application
-      run: "set -euo pipefail\nECR_URL=\"$(cat /tmp/ecr_url)\"\n# The root Application\
-        \ creates the children; wait for each to exist\n# before patching. This is\
-        \ cluster state - the repository is never\n# modified, which is what lets\
-        \ selfHeal stay on permanently.\n#\n# BOTH parameters are always sent together.\
-        \ The patch is a MERGE patch\n# and `parameters` is a LIST, so a merge REPLACES\
-        \ the whole list\n# rather than adding to it. Sending image.tag alone would\
-        \ delete\n# image.repository and the chart's `app.image` helper would fail\
-        \ the\n# render with \"image.repository is empty\".\nfor APP in app-dev app-bluegreen\
-        \ app-canary; do\n  echo \"--- $APP\"\n  DEADLINE=$((SECONDS + 300))\n  until\
-        \ kubectl get application \"$APP\" -n argocd >/dev/null 2>&1; do\n    if [\
-        \ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo \"Application $APP was\
-        \ not created by the root app in time\"\n      kubectl get applications -n\
-        \ argocd\n      exit 1\n    fi\n    sleep 10\n  done\n  kubectl patch application\
-        \ \"$APP\" --namespace argocd --type merge \\\n    --patch \"{\\\"spec\\\"\
-        :{\\\"source\\\":{\\\"helm\\\":{\\\"parameters\\\":[{\\\"name\\\":\\\"image.repository\\\
-        \",\\\"value\\\":\\\"${ECR_URL}\\\"},{\\\"name\\\":\\\"image.tag\\\",\\\"\
-        value\\\":\\\"${GITHUB_SHA}\\\"}]}}}}\"\n  echo \"patched $APP to ${GITHUB_SHA}\"\
-        \ndone\n"
-    - name: Refresh the repo-server cache so the patch is rendered
-      run: "set -euo pipefail\n# THE ORDERING ARTEFACT THIS CLOSES.\n#\n# On a fresh\
-        \ cluster the root Application creates each child with an\n# empty `parameters:\
-        \ []`. Argo CD renders it immediately, the chart's\n# image guard fails, and\
-        \ the repo-server CACHES that failure. The\n# patch above then lands - but\
-        \ Argo keeps serving the STALE cached\n# error once its retry backoff is spent,\
-        \ and the Application sits at\n# sync=Unknown with a ComparisonError reading\
-        \ \"(cached)\".\n#\n# That exact state was previously cleared BY HAND with\
-        \ this same\n# restart. Doing it here makes the fix part of the deploy instead\
-        \ of\n# tribal knowledge. It is cheap and harmless when nothing was cached.\n\
-        #\n# A hard refresh annotation alone is NOT sufficient: it re-renders but\n\
-        # can still be served from the failed-render cache. Restarting the\n# repo-server\
-        \ empties that cache outright.\nkubectl -n argocd rollout restart deployment\
-        \ argocd-repo-server\nkubectl -n argocd rollout status deployment argocd-repo-server\
-        \ --timeout=5m\n# Ask each Application to re-compare against a freshly rendered\
-        \ source.\nfor APP in app-dev app-bluegreen app-canary; do\n  kubectl -n argocd\
-        \ annotate application \"$APP\" \\\n    argocd.argoproj.io/refresh=hard --overwrite\n\
-        done\necho \"repo-server cache cleared and a hard refresh requested\"\n"
-    - name: Confirm the image parameters survived root's reconciliation
-      run: "set -euo pipefail\n# The patch above writes CLUSTER state onto objects\
-        \ that the ROOT\n# Application manages from Git, where they are rendered with\
-        \ an empty\n# `parameters: []`. root therefore has ignoreDifferences on\n\
-        # /spec/source/helm/parameters - without it, selfHeal reverts the\n# patch\
-        \ within seconds and the child sits at sync=Unknown forever with\n# \"image.repository\
-        \ is empty\" (that is exactly how a previous deploy\n# failed).\n#\n# ignoreDifferences\
-        \ is easy to attach to the wrong Application and\n# fails SILENTLY when it\
-        \ is, so assert the outcome here rather than\n# trusting the patch. Watch\
-        \ across several reconcile loops: a revert\n# is not instantaneous.\nDEADLINE=$((SECONDS\
-        \ + 180))\nwhile true; do\n  for APP in app-dev app-bluegreen app-canary;\
-        \ do\n    TAG=\"$(kubectl get application \"$APP\" -n argocd \\\n      -o\
-        \ jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\")].value}'\
-        \ 2>/dev/null || true)\"\n    if [ \"$TAG\" != \"$GITHUB_SHA\" ]; then\n \
-        \     echo \"ERROR: image.tag on ${APP} is '${TAG:-<empty>}', expected the\
-        \ commit SHA.\"\n      echo \"The root Application reverted the patch, which\
-        \ means its\"\n      echo \"ignoreDifferences for /spec/source/helm/parameters\
-        \ is missing\"\n      echo \"or attached to the wrong Application.\"\n   \
-        \   kubectl get application root -n argocd -o jsonpath='{.spec.ignoreDifferences}'\n\
-        \      exit 1\n    fi\n  done\n  if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n\
-        \    echo \"OK: image parameters stable on all applications for 180s\"\n \
-        \   break\n  fi\n  sleep 15\ndone\n"
+      run: "set -euo pipefail\n# Fail loudly if the image stage's write-back SHA did\
+        \ not arrive.\n# An empty targetRevision renders as `targetRevision: \"\"\
+        `, which Argo\n# treats as HEAD of the default branch - it would probably\
+        \ work, and\n# that is exactly the problem: an invisible fallback to \"whatever\
+        \ main\n# happens to be\" is how a deploy silently ships the wrong version.\n\
+        if [ -z \"${GITOPS_TARGET_REVISION:-}\" ]; then\n  echo \"ERROR: GITOPS_TARGET_REVISION\
+        \ is empty.\"\n  echo \"It comes from needs.image.outputs.gitops_sha, set\
+        \ by the image\"\n  echo \"stage's write-back step. An empty value means that\
+        \ step did\"\n  echo \"not run or did not export its output.\"\n  exit 1\n\
+        fi\necho \"pinning the root Application to ${GITOPS_TARGET_REVISION}\"\nexport\
+        \ GITOPS_REPO_URL GITOPS_TARGET_REVISION\nenvsubst < gitops/root-app.yaml\
+        \ | kubectl apply -f -\n"
+    - name: Wait for every Application to converge on the committed image tag
+      run: "set -euo pipefail\n# THIS REPLACES THREE STEPS that the patch mechanism\
+        \ required: a\n# `kubectl patch` loop, a repo-server cache-bust restart, and\
+        \ an\n# assertion that the patch had not been reverted.\n#\n# None of them\
+        \ are needed now. The tag is committed in\n# gitops/apps/values.yaml, root\
+        \ is pinned to that exact commit, and\n# Argo renders the children from Git\
+        \ - so the parameters cannot be\n# \"reverted\", there is no stale failed\
+        \ render to bust (the first\n# render already carries a valid tag), and nothing\
+        \ writes to the\n# cluster that Git disagrees with.\n#\n# What remains is\
+        \ an honest WAIT: confirm each Application actually\n# reports the tag we\
+        \ committed. This proves the loop closed rather\n# than assuming it did.\n\
+        EXPECTED=\"$GITHUB_SHA\"\nfor APP in app-dev app-bluegreen app-canary; do\n\
+        \  echo \"--- $APP (expecting image.tag=${EXPECTED})\"\n  DEADLINE=$((SECONDS\
+        \ + 420))\n  until kubectl get application \"$APP\" -n argocd >/dev/null 2>&1;\
+        \ do\n    if [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo \"ERROR:\
+        \ the root Application did not create ${APP} in time.\"\n      kubectl get\
+        \ applications -n argocd\n      kubectl get application root -n argocd -o\
+        \ jsonpath='{.status.conditions}'\n      exit 1\n    fi\n    sleep 10\n  done\n\
+        \  while true; do\n    TAG=\"$(kubectl get application \"$APP\" -n argocd\
+        \ \\\n      -o jsonpath='{.spec.source.helm.parameters[?(@.name==\"image.tag\"\
+        )].value}' 2>/dev/null || true)\"\n    if [ \"$TAG\" = \"$EXPECTED\" ]; then\n\
+        \      echo \"  OK: ${APP} is on ${EXPECTED}\"\n      break\n    fi\n    if\
+        \ [ \"$SECONDS\" -ge \"$DEADLINE\" ]; then\n      echo \"ERROR: ${APP} reports\
+        \ image.tag='${TAG:-<empty>}', expected ${EXPECTED}.\"\n      echo \"root\
+        \ is pinned to ${GITOPS_TARGET_REVISION}; check that the\"\n      echo \"\
+        write-back commit contains that tag and that root synced it.\"\n      kubectl\
+        \ get application root -n argocd -o jsonpath='{.status.conditions}'\n    \
+        \  echo\n      kubectl get application \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n\
+        \      exit 1\n    fi\n    sleep 15\n  done\ndone\necho \"all applications\
+        \ converged on ${EXPECTED} from Git\"\n"
   verify:
     runs-on: ubuntu-latest
     needs:
@@ -449,11 +467,10 @@ jobs:
         \ ]; then\n      echo \"timed out waiting for $APP (sync=$SYNC health=$HEALTH)\"\
         \n      # sync=Unknown means Argo could not RENDER the source. The\n     \
         \ # ComparisonError condition carries the helm template error and\n      #\
-        \ is far more useful than the describe output alone. A \"(cached)\"\n    \
-        \  # prefix means a STALE failed render - the configure stage's\n      # repo-server\
-        \ restart is what clears it.\n      kubectl get application \"$APP\" -n argocd\
-        \ -o jsonpath='{.status.conditions}'\n      echo\n      kubectl describe application\
-        \ \"$APP\" -n argocd\n      exit 1\n    fi\n    sleep 15\n  done\ndone\n"
+        \ is far more useful than the describe output alone.\n      kubectl get application\
+        \ \"$APP\" -n argocd -o jsonpath='{.status.conditions}'\n      echo\n    \
+        \  kubectl describe application \"$APP\" -n argocd\n      exit 1\n    fi\n\
+        \    sleep 15\n  done\ndone\n"
     - name: Confirm the Rollout workloads reached a stable state
       run: "set -euo pipefail\n# A blue/green Rollout with autoPromotionEnabled=false\
         \ PAUSES at\n# `Paused` on its FIRST revision by design, waiting for a human\n\

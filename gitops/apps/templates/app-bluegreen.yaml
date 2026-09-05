@@ -1,6 +1,12 @@
 {{- if not .Values.repoURL }}
 {{- fail "repoURL is empty - the root Application must pass it as a Helm parameter" }}
 {{- end }}
+{{- if not .Values.imageRepository }}
+{{- fail "imageRepository is empty in gitops/apps/values.yaml - the image stage writes it from `terraform output -raw ecr_repository_url`" }}
+{{- end }}
+{{- if not .Values.imageTagBluegreen }}
+{{- fail "imageTagBluegreen is empty in gitops/apps/values.yaml - the image stage commits the pushed image tag there" }}
+{{- end }}
 # ---------------------------------------------------------------------------
 # app-bluegreen — the same application chart, released with an Argo Rollouts
 # blue/green strategy, in its own namespace.
@@ -8,17 +14,18 @@
 # Rendered by the app-of-apps ROOT, which passes repoURL down as a Helm
 # parameter. Nothing here hardcodes an org/repo pair.
 #
-# blueGreen.enabled is set through `helm.values` rather than `parameters`
-# ON PURPOSE. The configure stage patches spec.source.helm.PARAMETERS to inject
-# image.repository/image.tag, and a merge patch REPLACES that whole list — so
-# anything stored there would be wiped on the next deploy. `values` is a
-# separate field the patch never touches.
+# THE IMAGE TAG COMES FROM GIT (gitops/apps/values.yaml, key imageTagBluegreen,
+# written and committed by the `image` stage). A separate key per environment is
+# what lets the rollback workflow move THIS environment back without touching
+# app-dev or app-canary.
+#
+# blueGreen.enabled is set through `helm.values` rather than `parameters`. That
+# split no longer matters for safety — nothing patches parameters any more — but
+# it stays because it reads better: strategy is a structural choice, the image
+# is a version.
 #
 # ingress.enabled=false: this instance is exercised in-cluster. Each enabled
 # Ingress provisions its own billable ALB with a public endpoint.
-#
-# The ignoreDifferences protecting the patched parameters lives on the ROOT
-# Application, not here - see gitops/root-app.yaml.
 # ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -42,7 +49,11 @@ spec:
           enabled: true
         ingress:
           enabled: false
-      parameters: []
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: image.tag
+          value: {{ .Values.imageTagBluegreen | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: app-bluegreen
@@ -58,10 +69,11 @@ spec:
         duration: 15s
         factor: 2
         maxDuration: 3m
-  # The Rollouts controller OWNS the replica count during a release and mutates
-  # the active/preview Service selectors as it promotes. Without these
-  # exemptions Argo CD sees controller-driven changes as drift and selfHeal
-  # fights the promotion mid-flight.
+  # KEEP THESE. They are a DIFFERENT concern from the removed parameters
+  # exemption: the Rollouts CONTROLLER owns the replica count during a release
+  # and mutates the active/preview Service selectors as it promotes. Without
+  # these, Argo CD reads controller-driven changes as drift and selfHeal fights
+  # the promotion mid-flight. Nothing in CI writes these fields.
   ignoreDifferences:
     - group: argoproj.io
       kind: Rollout

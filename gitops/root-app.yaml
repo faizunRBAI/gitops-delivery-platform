@@ -8,6 +8,28 @@
 # $GITOPS_REPO_URL is substituted by the configure stage (envsubst) at apply
 # time and passed DOWN to the children as a Helm parameter, so no manifest in
 # this repository hardcodes an org/repo pair.
+#
+# ${GITOPS_TARGET_REVISION} is the commit the `image` stage created when it
+# wrote the new image tag into gitops/apps/values.yaml. The configure job
+# checked out the commit that TRIGGERED the run, which is the PARENT of that
+# write-back commit — so pinning root to $GITHUB_SHA would sync Argo to a
+# revision whose values.yaml still names the PREVIOUS image. Pointing it at the
+# write-back SHA is what makes the deploy deterministic instead of dependent on
+# Argo happening to poll after the push.
+#
+# NO ignoreDifferences HERE ANY MORE, AND THAT IS THE FIX.
+#
+# It used to carry an exemption for /spec/source/helm/parameters, because the
+# configure stage patched the image tag onto the CHILD Applications while Git
+# declared `parameters: []` — so root's selfHeal would revert CI's patch unless
+# told to ignore that field. That is fighting the reconciler: cluster state and
+# Git state deliberately disagreeing, with an exemption to stop the disagreement
+# being corrected. It failed on 2026-09-05 exactly as designed to.
+#
+# The image tag now lives in gitops/apps/values.yaml and is rendered into the
+# children's parameters FROM GIT. Root and the cluster agree, so there is
+# nothing to exempt. Re-adding an ignoreDifferences here would re-open the door
+# to cluster state drifting from Git unnoticed — do not.
 # ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -20,7 +42,7 @@ spec:
   project: default
   source:
     repoURL: ${GITOPS_REPO_URL}
-    targetRevision: main
+    targetRevision: ${GITOPS_TARGET_REVISION}
     path: gitops/apps
     helm:
       releaseName: root
@@ -33,31 +55,12 @@ spec:
     server: https://kubernetes.default.svc
     namespace: argocd
   syncPolicy:
-    # Safe because Argo CD is the SOLE writer of gitops/ and chart/: the
-    # pipeline never commits to either path, so selfHeal has nothing to fight.
+    # Safe because Argo CD is now the SOLE writer of cluster state for gitops/
+    # and chart/: CI writes to GIT and never to the cluster, so selfHeal has
+    # nothing to fight. This is the property the patch mechanism destroyed and
+    # the Git write-back restores.
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
-  # THIS BELONGS HERE, ON THE ROOT — not on the child.
-  #
-  # The configure stage patches image.repository and image.tag onto the CHILD
-  # Application (app-dev) with `kubectl patch`, which makes the running version
-  # cluster state rather than Git state. But the object that MANAGES app-dev is
-  # THIS root Application: root renders app-dev from gitops/apps/ with an empty
-  # `parameters: []` and, with selfHeal on, reverts anything that differs.
-  #
-  # An ignoreDifferences declared on app-dev itself is powerless here — it
-  # governs how app-dev compares ITS OWN managed resources (the Deployment,
-  # Service and Ingress), not how root compares app-dev. The child cannot
-  # exempt itself from its parent's reconciliation.
-  #
-  # Without this block the sequence is: configure patches the parameters, root
-  # self-heals them back to [], the chart's image.repository guard fires, and
-  # app-dev sits at sync=Unknown with a ComparisonError forever.
-  ignoreDifferences:
-    - group: argoproj.io
-      kind: Application
-      jsonPointers:
-        - /spec/source/helm/parameters
